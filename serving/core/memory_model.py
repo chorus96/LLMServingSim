@@ -14,7 +14,7 @@ class Device(Enum):
     CXL = 3
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto'):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', enable_attn_offloading=False, pim_on_cxl=False):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -22,7 +22,7 @@ class MemoryModel():
         self.tp_size = tp_size
         self.pp_size = pp_size
         self.ep_size = ep_size
-        self.npu_mem = npu_mem * GB_TO_BYTE # GB -> Byte
+        real_npu_mem = npu_mem * GB_TO_BYTE # GB -> Byte (physical GPU HBM)
         self.cpu_mem = cpu_mem * GB_TO_BYTE # GB -> Byte
         self.cxl_mem = cxl_mem * GB_TO_BYTE
         self.block_size = block_size
@@ -50,10 +50,24 @@ class MemoryModel():
 
         # Memory model
         self.weight = self.get_weight() # assume weight is loaded
+        # Weights always live in physical GPU HBM.
+        if self.weight > real_npu_mem:
+            raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.num_npus//GB_TO_BYTE}GB exceeds total NPU memory {real_npu_mem*self.num_npus//GB_TO_BYTE}GB")
+
+        # KV-cache capacity source. Normally the KV cache lives in GPU HBM, so
+        # its budget is (npu_mem - weight). When the PNM is CXL-attached, the KV
+        # cache instead lives on the CXL tier (NELSSA's "capacity decoupled from
+        # the GPU"), so the CXL device's capacity bounds the KV budget while the
+        # weights stay in HBM. Modeled by extending the NPU KV budget to
+        # (weight + cxl_mem): the scheduler's NPU KV admission then caps at the
+        # CXL capacity, and overflow spills to the (distinct) host CPU tier.
+        self.kv_on_cxl = bool(enable_attn_offloading and pim_on_cxl and self.cxl_mem > 0)
+        if self.kv_on_cxl:
+            self.npu_mem = self.weight + self.cxl_mem
+        else:
+            self.npu_mem = real_npu_mem
         self.npu_used = self.weight
         self.cpu_used = 0
-        if self.weight > self.npu_mem:
-            raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.num_npus//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.num_npus//GB_TO_BYTE}GB")
 
         if enable_prefix_caching:
             one_token_kv_size = self.get_kv(1)

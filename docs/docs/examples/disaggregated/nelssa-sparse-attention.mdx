@@ -152,6 +152,15 @@ tier. See `configs/cluster/single_node_nelssa_cxl_pnm_instance.json`:
 Everything else (sparse ratio, GPU-local split, index build) works
 identically — only the PNM's memory tier and trace location tags change.
 
+**KV capacity is sourced from the CXL tier.** With a CXL-attached PNM the
+KV cache lives on the CXL device, so its capacity — not the GPU's — bounds
+the KV budget: the scheduler admits KV up to `cxl_mem.mem_size` and a
+sequence that exceeds it stalls/OOMs (weights stay in GPU HBM). This is
+automatic; you no longer size `npu_mem = weight + capacity` by hand. A
+128 GB CXL PNM caps KV where a 1 TB one keeps running — reproducing the
+CXL-PNM vs HC-PNM capacity trade-off directly. (For the default cpu_mem-
+attached PNM the KV budget stays `npu_mem − weight`, unchanged.)
+
 ## Flags
 
 | Flag | Meaning |

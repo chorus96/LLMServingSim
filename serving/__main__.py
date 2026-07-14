@@ -514,6 +514,8 @@ def main():
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+            enable_attn_offloading=inst_cfg["enable_attn_offloading"],
+            pim_on_cxl=pim_on_cxl,
         ))
 
     # Controller for astra-sim process communication
