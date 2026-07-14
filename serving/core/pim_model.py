@@ -158,6 +158,20 @@ class PIMModel:
                 "slope": 242.0548,
                 "intercept": 14513.5015
             },
+            # NELSSA HC-PNM module (4-CH DDR5-6400, 200 GB/s, 1 TB). Derived
+            # from DDR4_8GB_3200_pim (identical bus_width=64 byte model) since
+            # NELSSA's compute engine is provisioned to saturate the module's
+            # bandwidth, making full attention bandwidth-bound:
+            #   slope     scales inversely with bandwidth (2x data_rate):
+            #             333.2538 * (3200 / 6400) = 166.6269
+            #   intercept scales with first-word read latency (CL*tCK):
+            #             30675.2739 * (12.5 / 13.86) = 27665.40
+            # The slope-vs-bandwidth relation is validated by the LPDDR4X/
+            # LPDDR5 pair (slope ratio 1.531 vs data_rate ratio 1.501).
+            "DDR5_1TB_6400_pim": {
+                "slope": 166.6269,
+                "intercept": 27665.40
+            },
         }
 
         if self.spec_name not in attn_model:
