@@ -55,15 +55,23 @@ class MemoryModel():
             raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.num_npus//GB_TO_BYTE}GB exceeds total NPU memory {real_npu_mem*self.num_npus//GB_TO_BYTE}GB")
 
         # KV-cache capacity source. Normally the KV cache lives in GPU HBM, so
-        # its budget is (npu_mem - weight). When the PNM is CXL-attached, the KV
-        # cache instead lives on the CXL tier (NELSSA's "capacity decoupled from
-        # the GPU"), so the CXL device's capacity bounds the KV budget while the
+        # its budget is (npu_mem - weight). With attention offloading the KV
+        # cache instead lives on the PNM (NELSSA's "capacity decoupled from the
+        # GPU"), so the PNM device's capacity bounds the KV budget while the
         # weights stay in HBM. Modeled by extending the NPU KV budget to
-        # (weight + cxl_mem): the scheduler's NPU KV admission then caps at the
-        # CXL capacity, and overflow spills to the (distinct) host CPU tier.
+        # (weight + PNM capacity); the scheduler's NPU KV admission then caps at
+        # the PNM capacity.
+        #   - CXL-attached PNM (kv_on_cxl): capacity = cxl_mem; overflow can
+        #     spill to the distinct host CPU tier (eviction kept).
+        #   - remote-attached PNM (kv_on_remote): capacity = cpu_mem, which *is*
+        #     the spill tier, so eviction is disabled (the scheduler backs off
+        #     instead of double-counting) -- the PNM is the bottom tier.
         self.kv_on_cxl = bool(enable_attn_offloading and pim_on_cxl and self.cxl_mem > 0)
+        self.kv_on_remote = bool(enable_attn_offloading and not pim_on_cxl and self.cpu_mem > 0)
         if self.kv_on_cxl:
             self.npu_mem = self.weight + self.cxl_mem
+        elif self.kv_on_remote:
+            self.npu_mem = self.weight + self.cpu_mem
         else:
             self.npu_mem = real_npu_mem
         self.npu_used = self.weight

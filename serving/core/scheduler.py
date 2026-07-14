@@ -190,6 +190,11 @@ class Scheduler:
                     break
             
             # ============ STEP 3: Eviction if needed ============
+            # When the KV cache lives on the remote PNM (its capacity IS the
+            # spill target), there is no lower tier to evict to; back off and
+            # let running requests free PNM space instead of double-counting.
+            if temp_len == 0 and getattr(self.memory, "kv_on_remote", False):
+                return None
             while temp_len == 0:
                 # print("Evict Request to CPU due to memory limitation")
                 # preempt request one by one until there is enough space

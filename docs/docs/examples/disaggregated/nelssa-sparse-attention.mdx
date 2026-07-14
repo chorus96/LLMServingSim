@@ -116,13 +116,17 @@ markers), which is exactly where NELSSA's 1 TB HC-PNM + sparsity keeps
 running.
 
 :::note Modeling the capacity limit
-The simulator bounds the KV cache by the KV budget `npu_mem − weight`. To
-model the HB-PNM's 128 GB KV capacity (and its OOM boundary), set
-`npu_mem = weight + 128` in the config; a sequence whose KV exceeds the
-budget stalls/OOMs (for Llama-70B, 128 GB ≈ 400K tokens vs the HC-PNM's
-1 TB ≈ 3.2M). The device **bandwidth** is modeled by the PNM attention
-coefficients; the **capacity** by the KV budget. Both PNM baselines share
-the same PCIe 5.0 interconnect (`link_bw: 64`), matching the paper.
+With attention offloading the KV cache lives on the PNM, so the PNM
+device's capacity — not the GPU's — bounds the KV budget: it is sourced
+automatically from the PNM tier (`cpu_mem` for a remote-attached PNM,
+`cxl_mem` for a CXL-attached one), while weights stay in GPU HBM. A
+sequence whose KV exceeds it stalls/OOMs. So the HB-PNM baseline's 128 GB
+(`cpu_mem.mem_size: 128`) caps KV where the HC-PNM's 1 TB keeps going —
+for Llama-70B, ≈400K tokens vs ≈3.2M — with no manual `npu_mem` sizing.
+The device **bandwidth** is modeled by the PNM attention coefficients; the
+**capacity** by the KV budget. Both PNM baselines share the same PCIe 5.0
+interconnect (`link_bw: 64`), matching the paper. (Without offloading, the
+KV budget stays the ordinary `npu_mem − weight`.)
 :::
 
 ### CXL-attached PNM
@@ -152,14 +156,17 @@ tier. See `configs/cluster/single_node_nelssa_cxl_pnm_instance.json`:
 Everything else (sparse ratio, GPU-local split, index build) works
 identically — only the PNM's memory tier and trace location tags change.
 
-**KV capacity is sourced from the CXL tier.** With a CXL-attached PNM the
-KV cache lives on the CXL device, so its capacity — not the GPU's — bounds
-the KV budget: the scheduler admits KV up to `cxl_mem.mem_size` and a
-sequence that exceeds it stalls/OOMs (weights stay in GPU HBM). This is
-automatic; you no longer size `npu_mem = weight + capacity` by hand. A
-128 GB CXL PNM caps KV where a 1 TB one keeps running — reproducing the
-CXL-PNM vs HC-PNM capacity trade-off directly. (For the default cpu_mem-
-attached PNM the KV budget stays `npu_mem − weight`, unchanged.)
+**KV capacity is sourced from the PNM tier.** With attention offloading the
+KV cache lives on the PNM, so its capacity — not the GPU's — bounds the KV
+budget: the scheduler admits KV up to the PNM's `mem_size` and a sequence
+that exceeds it stalls/OOMs (weights stay in GPU HBM). This is automatic
+for both attachments — `cxl_mem.mem_size` for a CXL-attached PNM,
+`cpu_mem.mem_size` for a remote-attached one — with no manual `npu_mem`
+sizing. A 128 GB PNM caps KV where a 1 TB one keeps running, reproducing
+the CXL-PNM vs HC-PNM capacity trade-off directly. (A CXL PNM can spill
+overflow to the distinct host CPU tier; a remote PNM, being its own bottom
+tier, backs off instead. Without offloading, the budget stays the ordinary
+`npu_mem − weight`.)
 
 ## Flags
 
