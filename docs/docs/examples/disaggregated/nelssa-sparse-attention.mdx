@@ -158,6 +158,36 @@ Both live in `serving/core/pim_model.py::get_sparse_pim_latency`.
   caches far beyond HBM limits; sparse attention keeps the module's modest
   bandwidth from becoming the new bottleneck.
 
+## Running on Llama-70B (the paper's model class)
+
+NELSSA targets Llama-2/3-70B-scale models. A **derived** profile for
+`meta-llama/Llama-3.1-70B` on `RTXPRO6000` is bundled so the simulator can
+run the 70B architecture without a measured profile:
+
+```bash
+python -m serving \
+  --cluster-config 'configs/cluster/single_node_nelssa_70b_instance.json' \
+  --dtype bfloat16 --enable-attn-offloading \
+  --sparse-attention-ratio 0.02 \
+  --attention-local-window 1024 --attention-sink-tokens 4 \
+  --dataset 'workloads/example_trace.jsonl' \
+  --output 'outputs/nelssa_70b.csv' --log-level WARNING
+```
+
+:::caution Derived, not measured
+This 70B profile is **analytically scaled** from the measured
+Llama-3.1-8B profile (per-layer FLOP/byte ratios), not captured from real
+vLLM runs. Its `meta.yaml` records the provenance under `derived:`. Kernel
+launch overhead, tensor-core tiling, and bandwidth effects are not
+modeled, so absolute numbers are approximate — regenerate with a measured
+profile when one is available. It was produced with:
+
+```bash
+python profiler/tools/derive_profile.py --hardware RTXPRO6000 \
+  --source meta-llama/Llama-3.1-8B --target meta-llama/Llama-3.1-70B --variant bf16
+```
+:::
+
 ## Modeling notes
 
 - **Batch-level concurrency.** The GPU-local and PNM attentions overlap, so
