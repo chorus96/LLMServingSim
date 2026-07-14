@@ -117,6 +117,7 @@ class TraceCtx:
     attention_local_window: int = 0  # NELSSA GPU-local KV split: recent decode tokens kept on GPU HBM (0 = all decode KV on PIM)
     attention_sink_tokens: int = 0  # NELSSA GPU-local KV split: leading attention-sink tokens kept on GPU HBM
     sparse_index_build: bool = True  # NELSSA: model the RetrievalAttention vector-index build cost at prefill (only when sparse attention is active)
+    pim_on_cxl: bool = False  # PNM is CXL-attached: PIM blocks target CXL:{...} instead of REMOTE:{...}
 
 
 @dataclass
@@ -839,7 +840,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
                      sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
                      attention_local_window=0, attention_sink_tokens=0,
-                     sparse_index_build=True):
+                     sparse_index_build=True, pim_on_cxl=False):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -877,6 +878,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         attention_local_window=attention_local_window,
         attention_sink_tokens=attention_sink_tokens,
         sparse_index_build=sparse_index_build,
+        pim_on_cxl=pim_on_cxl,
     )
 
 
@@ -1017,6 +1019,7 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
     gpu_local_batch)`` (combining the two partial results is negligible per
     the paper). With no local window the whole KV goes to PIM, unchanged.
     """
+    pim_tier = "CXL" if ctx.pim_on_cxl else "REMOTE"  # CXL-attached vs remote PNM
     local_w = ctx.attention_sink_tokens + ctx.attention_local_window
     channel_sums = [0] * ctx.pim_channels  # PNM bulk time per channel (parallel)
     windows = []                           # per-request GPU-local window sizes
@@ -1052,9 +1055,9 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
 
             pim_lat = max(1, int(pim_bulk_ns))
             lines.append(formatter("attention", str(pim_lat),
-                f'REMOTE:{ctx.node_id}.{ch}', str(inp),
+                f'{pim_tier}:{ctx.node_id}.{ch}', str(inp),
                 get_device(ctx.placement, layer_num, "attention", "weights"), '0',
-                f'REMOTE:{ctx.node_id}.{ch}', str(out),
+                f'{pim_tier}:{ctx.node_id}.{ch}', str(out),
                 'NONE', '0', batch_tag))
             channel_sums[ch] += pim_lat
             if power_acc is not None and pim_bulk_ns > 0:
@@ -1416,7 +1419,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       tp_dim=None, ep_dim=None, dp_sum_total_len=0,
                       sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
                       attention_local_window=0, attention_sink_tokens=0,
-                      sparse_index_build=True):
+                      sparse_index_build=True, pim_on_cxl=False):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1427,7 +1430,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            sparse_vector_search_nprobe=sparse_vector_search_nprobe,
                            attention_local_window=attention_local_window,
                            attention_sink_tokens=attention_sink_tokens,
-                           sparse_index_build=sparse_index_build)
+                           sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1477,7 +1480,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   tp_dim=None, ep_dim=None, dp_sum_total_len=0,
                                   sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
                                   attention_local_window=0, attention_sink_tokens=0,
-                                  sparse_index_build=True):
+                                  sparse_index_build=True, pim_on_cxl=False):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1488,7 +1491,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            sparse_vector_search_nprobe=sparse_vector_search_nprobe,
                            attention_local_window=attention_local_window,
                            attention_sink_tokens=attention_sink_tokens,
-                           sparse_index_build=sparse_index_build)
+                           sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1586,7 +1589,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
                    sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
                    attention_local_window=0, attention_sink_tokens=0,
-                   sparse_index_build=True):
+                   sparse_index_build=True, pim_on_cxl=False):
 
     model = batch.model
     config = get_config(model)
@@ -1642,7 +1645,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         sparse_vector_search_nprobe=sparse_vector_search_nprobe,
                         attention_local_window=attention_local_window,
                         attention_sink_tokens=attention_sink_tokens,
-                        sparse_index_build=sparse_index_build)
+                        sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:

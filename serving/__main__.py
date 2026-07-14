@@ -396,6 +396,7 @@ def main():
     power_modeling = cluster["power_modeling"]
     power_configs = cluster["power_configs"]
     pim_models = cluster["pim_models"]
+    pim_on_cxl = cluster.get("pim_on_cxl", False)
     instance_runtime_configs = _build_instance_runtime_configs(instances, args, _dtype_to_bits)
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
     # ----------------------------------------- Set config -----------------------------------------
@@ -714,6 +715,7 @@ def main():
                                        attention_local_window=inst_cfg["attention_local_window"],
                                        attention_sink_tokens=inst_cfg["attention_sink_tokens"],
                                        sparse_index_build=inst_cfg["sparse_index_build"],
+                                       pim_on_cxl=pim_on_cxl,
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -786,6 +788,7 @@ def main():
                                            attention_local_window=inst_cfg["attention_local_window"],
                                            attention_sink_tokens=inst_cfg["attention_sink_tokens"],
                                            sparse_index_build=inst_cfg["sparse_index_build"],
+                                           pim_on_cxl=pim_on_cxl,
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -827,6 +830,7 @@ def main():
                                    attention_local_window=inst_cfg["attention_local_window"],
                                    attention_sink_tokens=inst_cfg["attention_sink_tokens"],
                                    sparse_index_build=inst_cfg["sparse_index_build"],
+                                   pim_on_cxl=pim_on_cxl,
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

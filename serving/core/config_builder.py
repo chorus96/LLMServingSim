@@ -305,17 +305,40 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     mem_required_keys = ["mem_size", "mem_bw", "mem_latency"]
 
     cxl_mem_size = 0
+    cxl_pim_model = None
+    pim_on_cxl = False
     if "cxl_mem" in cluster_config:
         cxl = cluster_config["cxl_mem"]
-        for key in mem_required_keys:
-            if key not in cxl:
-                raise KeyError(f"Missing required key '{key}' in 'cxl_mem' configuration.")
-        memory_config["cxl_mem"] = {
-            "memory-type": "MEMORY_POOL",
-            "mem-bw": cxl["mem_bw"],
-            "mem-latency": cxl["mem_latency"],
-            "num-devices": cxl.get("num_devices", 1)
-        }
+        if "mem_size" not in cxl:
+            raise KeyError("Missing required key 'mem_size' in 'cxl_mem' configuration.")
+        if enable_attn_offloading and "pim_config" in cxl:
+            # CXL-attached PNM: the PNM's near-memory compute AND memory live on
+            # the CXL tier (CXL.mem link). The device's bandwidth/latency define
+            # the tier; the PIM attention runs against CXL:{...} trace locations.
+            pim_on_cxl = True
+            cxl_pim_path = f'../configs/pim/{cxl["pim_config"]}.ini'
+            cxl_pim_model = PIMModel(0, cxl["mem_size"], cxl_pim_path)
+            cxl_pim_cfg = cxl_pim_model.get_config()
+            cxl["mem_bw"] = cxl_pim_cfg["mem_bw"]
+            cxl["mem_latency"] = cxl_pim_cfg["mem_latency"]
+            memory_config["cxl_mem"] = {
+                "memory-type": "MEMORY_POOL",
+                "mem-bw": cxl_pim_cfg["mem_bw"],
+                "mem-latency": cxl_pim_cfg["mem_latency"],
+                "num-devices": cxl.get("num_devices", 1),
+                # one PIM channel per DIMM, same convention as the remote tier
+                "pim-channels": int(cxl["mem_size"] // cxl_pim_cfg["dimm_size"]),
+            }
+        else:
+            for key in mem_required_keys:
+                if key not in cxl:
+                    raise KeyError(f"Missing required key '{key}' in 'cxl_mem' configuration.")
+            memory_config["cxl_mem"] = {
+                "memory-type": "MEMORY_POOL",
+                "mem-bw": cxl["mem_bw"],
+                "mem-latency": cxl["mem_latency"],
+                "num-devices": cxl.get("num_devices", 1)
+            }
         cxl_mem_size = cxl["mem_size"]
 
     # Check if all required arguments are present in each node
@@ -433,7 +456,17 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         cpu_mem = node_config["cpu_mem"]
 
         # overwrite cpu_mem config with pim_config
-        if enable_attn_offloading:
+        if enable_attn_offloading and pim_on_cxl:
+            # PNM lives on the CXL tier (shared cluster-level device). cpu_mem
+            # stays a normal remote tier; the PIM attention targets CXL.
+            pim_model = cxl_pim_model
+            pim_models[node_id] = pim_model
+            pim_config = pim_model.get_config()
+            for key in mem_required_keys:
+                if key not in cpu_mem:
+                    raise KeyError(f"Missing required key '{key}' in 'cpu_mem' configuration.")
+
+        elif enable_attn_offloading:
             # parse pim config
             if "pim_config" not in cpu_mem:
                 raise KeyError("Missing 'pim_config' in 'cpu_mem' configuration while attention offloading is enabled.")
@@ -491,8 +524,10 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                 "mem-latency": cpu_mem["mem_latency"],
                 "num-devices": num_nodes
             }
-            # only one type of PIM memory config is supported for now
-            if enable_attn_offloading:
+            # only one type of PIM memory config is supported for now.
+            # When the PNM is CXL-attached (pim_on_cxl) the remote/CPU tier is
+            # an ordinary memory, so it gets no pim-channels here.
+            if enable_attn_offloading and not pim_on_cxl:
                 memory_config["remote_mem"]["pim-channels"] = cpu_mem["mem_size"] // pim_config["dimm_size"] # one pim channel has one dimm
             cpu_mem_enabled = True
         
@@ -657,6 +692,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         "power_modeling": power_modeling,
         "power_configs": power_configs,
         "pim_models": pim_models,
+        "pim_on_cxl": pim_on_cxl,
         "link_bw": link_bw,
         "link_latency": link_latency,
         "inputs_root": inputs_root,

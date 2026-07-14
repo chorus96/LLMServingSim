@@ -125,6 +125,33 @@ coefficients; the **capacity** by the KV budget. Both PNM baselines share
 the same PCIe 5.0 interconnect (`link_bw: 64`), matching the paper.
 :::
 
+### CXL-attached PNM
+
+By default the PNM attaches to the node's `cpu_mem` (remote) tier and its
+trace targets `REMOTE:` locations. To model a **CXL-attached** PNM instead
+(the original CXL-PNM [4] platform is a CXL.mem device), put `pim_config`
+inside the top-level `cxl_mem` block. The PNM's near-memory compute and
+memory then live on the CXL tier: `config_builder` sizes the CXL tier's
+bandwidth/latency and `pim-channels` from the device, and PIM attention
+targets `CXL:{node}.{ch}` locations. `cpu_mem` stays an ordinary remote
+tier. See `configs/cluster/single_node_nelssa_cxl_pnm_instance.json`:
+
+```json title="single_node_nelssa_cxl_pnm_instance.json (excerpt)"
+{
+  "cxl_mem": {
+    "mem_size": 1024, "mem_bw": 205, "mem_latency": 250,
+    "num_devices": 4, "pim_config": "DDR5_1TB_6400_pim"
+  },
+  "nodes": [{
+    "cpu_mem": {"mem_size": 512, "mem_bw": 256, "mem_latency": 0},
+    "instances": [{ "...": "enable_attn_offloading: true" }]
+  }]
+}
+```
+
+Everything else (sparse ratio, GPU-local split, index build) works
+identically — only the PNM's memory tier and trace location tags change.
+
 ## Flags
 
 | Flag | Meaning |
