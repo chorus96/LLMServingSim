@@ -72,7 +72,7 @@ The same config serves as both experiment arms:
 # NELSSA: 2% dynamic sparse attention on the HC-PNM module
 python -m serving \
   --cluster-config 'configs/cluster/single_node_nelssa_hcpnm_instance.json' \
-  --dtype float16 --block-size 16 \
+  --dtype bfloat16 --block-size 16 \
   --enable-attn-offloading \
   --sparse-attention-ratio 0.02 \
   --dataset 'workloads/example_trace.jsonl' \
@@ -103,7 +103,7 @@ overhead. Enable it with:
 ```bash
 python -m serving \
   --cluster-config 'configs/cluster/single_node_nelssa_hcpnm_instance.json' \
-  --dtype float16 --enable-attn-offloading \
+  --dtype bfloat16 --enable-attn-offloading \
   --sparse-attention-ratio 0.02 \
   --attention-local-window 1024 --attention-sink-tokens 4 \
   --dataset 'workloads/example_trace.jsonl' \
