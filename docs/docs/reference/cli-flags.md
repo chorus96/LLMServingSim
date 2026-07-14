@@ -57,6 +57,8 @@ matching runtime knobs per `instances[i]`; see
 | `--enable-local-offloading` | off | Weight offloading to NPU (counts weight reads in profiling) |
 | `--enable-attn-offloading` | off | Attention computation offloading to PIM |
 | `--enable-sub-batch-interleaving` | off | Overlap GPU compute with PIM attention. Requires `--enable-attn-offloading` |
+| `--sparse-attention-ratio` | `None` | NELSSA dynamic sparse attention: fraction of KV tokens kept per decode step (e.g. `0.02`). Requires `--enable-attn-offloading` |
+| `--sparse-vector-search-nprobe` | `32` | IVF lists probed during NELSSA token selection (vector search) |
 
 ## Dataset and output
 

@@ -166,6 +166,20 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             raise RuntimeError(
                 f"Instance {instance_id} enables sub-batch interleaving without attention offloading")
 
+        sparse_attention_ratio = instance.get(
+            "sparse_attention_ratio", args.sparse_attention_ratio)
+        sparse_vector_search_nprobe = instance.get(
+            "sparse_vector_search_nprobe", args.sparse_vector_search_nprobe)
+        if sparse_attention_ratio is not None:
+            if not enable_attn_offloading:
+                raise RuntimeError(
+                    f"Instance {instance_id} sets sparse_attention_ratio without attention "
+                    f"offloading; NELSSA sparse attention runs on PIM (--enable-attn-offloading)")
+            if not (0.0 < sparse_attention_ratio <= 1.0):
+                raise ValueError(
+                    f"Instance {instance_id} sparse_attention_ratio must be in (0, 1], "
+                    f"got {sparse_attention_ratio}")
+
         runtime_configs.append({
             "max_num_seqs": _runtime_limit(instance.get("max_num_seqs", args.max_num_seqs)),
             "max_num_batched_tokens": _runtime_limit(
@@ -186,6 +200,8 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_attn_offloading": enable_attn_offloading,
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
+            "sparse_attention_ratio": sparse_attention_ratio,
+            "sparse_vector_search_nprobe": sparse_vector_search_nprobe,
         })
     return runtime_configs
 
@@ -257,6 +273,14 @@ def main():
     parser.add_argument('--enable-sub-batch-interleaving', action='store_true', default=False,
                         help='enable sub-batch interleaving to overlap XPU and PIM computation. '
                         'Requires --enable-attn-offloading')
+    parser.add_argument('--sparse-attention-ratio', type=float, default=None,
+                        help='NELSSA dynamic sparse attention: fraction of KV tokens kept per '
+                        'decode step (e.g. 0.02 for 2%%). When set, PIM attention streams only '
+                        'the top-k selected tokens plus a token-selection cost instead of the '
+                        'full KV cache. Requires --enable-attn-offloading. Default: full attention')
+    parser.add_argument('--sparse-vector-search-nprobe', type=int, default=32,
+                        help='number of IVF lists probed during NELSSA token selection (vector '
+                        'search). Higher = more recall and higher selection cost. Default: 32')
     parser.add_argument('--prioritize-prefill', action='store_true', default=False,
                         help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
@@ -657,6 +681,8 @@ def main():
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
+                                       sparse_attention_ratio=inst_cfg["sparse_attention_ratio"],
+                                       sparse_vector_search_nprobe=inst_cfg["sparse_vector_search_nprobe"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -724,6 +750,8 @@ def main():
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
+                                           sparse_attention_ratio=inst_cfg["sparse_attention_ratio"],
+                                           sparse_vector_search_nprobe=inst_cfg["sparse_vector_search_nprobe"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -760,6 +788,8 @@ def main():
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"],
+                                   sparse_attention_ratio=inst_cfg["sparse_attention_ratio"],
+                                   sparse_vector_search_nprobe=inst_cfg["sparse_vector_search_nprobe"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

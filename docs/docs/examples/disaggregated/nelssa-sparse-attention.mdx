@@ -1,0 +1,137 @@
+---
+title: NELSSA sparse attention (HC-PNM)
+sidebar_position: 4
+---
+
+# NELSSA sparse attention on HC-PNM
+
+> **What this demonstrates:** multi-million-token decode on a
+> high-capacity PNM (HC-PNM) module using **dynamic sparse attention** —
+> streaming only the top-k selected KV tokens instead of the whole cache.
+
+[NELSSA](https://doi.org/10.1109/LCA.2025.3624272) (SK hynix, IEEE CAL
+2025, *"PNM Meets Sparse Attention"*) targets the extreme resource
+imbalance of long-sequence decode: the KV cache demands enormous memory
+capacity and bandwidth, yet the attention compute is tiny. Its insight is
+to pair a **high-capacity PNM** module (cheap DDR5, huge capacity, modest
+~200 GB/s internal bandwidth) with **dynamic sparse attention** (keep only
+the ~2% of tokens that matter), so the low bandwidth is no longer the
+bottleneck.
+
+LLMServingSim models this as two composable pieces:
+
+1. **HC-PNM hardware** — a DDR5 PNM module config
+   (`configs/pim/DDR5_1TB_6400_pim.ini`: 4-channel DDR5-6400, 1 TB,
+   ~200 GB/s), attached like any other PIM substrate.
+2. **Sparse attention** — the `--sparse-attention-ratio` flag makes the
+   PIM attention kernel stream only `ceil(ratio × L)` selected tokens and
+   adds a token-selection (vector-search) cost, instead of the full KV
+   cache.
+
+## Prerequisites
+
+- Simulator container set up
+- Bundled RTXPRO6000 profile for `meta-llama/Llama-3.1-8B`
+- The `DDR5_1TB_6400_pim` PIM config (bundled in `configs/pim/`)
+
+## Cluster config
+
+`configs/cluster/single_node_nelssa_hcpnm_instance.json`: the HC-PNM
+module is wired in via `cpu_mem.pim_config`, and attention offloading is
+enabled per-instance:
+
+```json title="single_node_nelssa_hcpnm_instance.json (excerpt)"
+{
+  "cpu_mem": {
+    "mem_size": 1024,
+    "mem_bw": 205,
+    "mem_latency": 0,
+    "pim_config": "DDR5_1TB_6400_pim"
+  },
+  "instances": [
+    {
+      "model_name": "meta-llama/Llama-3.1-8B",
+      "hardware": "RTXPRO6000",
+      "npu_mem": {"mem_size": 96, "mem_bw": 1597, "mem_latency": 0},
+      "tp_size": 1,
+      "enable_attn_offloading": true
+    }
+  ]
+}
+```
+
+The same config serves as both experiment arms:
+
+- **Hermes-style HC-PNM baseline** (full attention): run **without**
+  `--sparse-attention-ratio`.
+- **NELSSA** (sparse attention): run **with** `--sparse-attention-ratio`.
+
+## Run
+
+```bash
+# NELSSA: 2% dynamic sparse attention on the HC-PNM module
+python -m serving \
+  --cluster-config 'configs/cluster/single_node_nelssa_hcpnm_instance.json' \
+  --dtype float16 --block-size 16 \
+  --enable-attn-offloading \
+  --sparse-attention-ratio 0.02 \
+  --dataset 'workloads/example_trace.jsonl' \
+  --output 'outputs/nelssa_run.csv' \
+  --log-level WARNING
+```
+
+Drop `--sparse-attention-ratio` to get the full-attention HC-PNM baseline
+for an A/B comparison on identical hardware.
+
+## Flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--sparse-attention-ratio` | Fraction of KV tokens kept per decode step (e.g. `0.02` = 2%). Unset → full attention. Requires `--enable-attn-offloading`. |
+| `--sparse-vector-search-nprobe` | IVF lists probed during token selection (vector search). Higher = more recall and higher selection cost. Default `32`. |
+
+## The model
+
+For a decode request whose KV cache holds `L` tokens, PIM attention
+latency becomes (per the two NELSSA compute-unit modes):
+
+- **M2 — sparse attention GEMV** over `k = ceil(ratio × L)` selected
+  tokens, reusing the bandwidth-bound linear model but streaming `k`
+  tokens instead of `L`.
+- **M1 — token selection** via IVF vector search. Following the paper's
+  √N heuristic, `n_list = round(√L)` and the `nprobe` probed lists hold
+  ~`nprobe × √L` key vectors; selection reads keys only (half the
+  per-token streaming of full attention).
+
+Both live in `serving/core/pim_model.py::get_sparse_pim_latency`.
+
+## What's interesting
+
+- **Speedup grows with sequence length.** Because sparse attention keeps
+  a *fixed fraction* of tokens, the win over full attention widens as `L`
+  grows — reproducing the paper's 11×–40× range over the HC-PNM
+  full-attention (Hermes) baseline from ~16K to multi-million tokens.
+- **Robust to the selection ratio.** Raising the ratio from 2% to 10%
+  grows per-token decode latency by only ~2–3× (the paper's Fig. 6
+  sensitivity), not 5×, because the fixed selection + pipeline overhead
+  amortizes.
+- **Capacity is decoupled from the GPU.** The 1 TB HC-PNM module holds KV
+  caches far beyond HBM limits; sparse attention keeps the module's modest
+  bandwidth from becoming the new bottleneck.
+
+## Limitations / next steps
+
+This models the PNM-side sparse attention (the paper's dominant decode
+cost). The GPU-local attention over *predictable* KVs (recent-window +
+attention sinks kept in HBM) and its concurrent overlap with the PNM
+modules are not yet modeled as a separate path — a decode step currently
+routes all selected-token attention to PIM. Adding the GPU-local window
+split is a natural follow-on.
+
+## Where to learn more
+
+- HC-PNM substrate: `configs/pim/DDR5_1TB_6400_pim.ini` and
+  `configs/pim/README.md`.
+- Sparse latency model: `serving/core/pim_model.py`
+  (`get_sparse_pim_latency`, `_scaled_coeffs`).
+- Trace emission: `serving/core/trace_generator.py::_emit_pim_attention`.

@@ -119,26 +119,14 @@ class PIMModel:
     
     def get_pim_latency(self, n_head, kv_head, head_dim, L, channel_split=1):
         return self.estimate_with_linear(n_head, kv_head, head_dim, L, channel_split) # ns
-    
-    def estimate_with_linear(self, n_head, kv_head, head_dim, L, channel_split=1):
-        """Estimate PIM attention latency using linear model.
 
-        Supports arbitrary model architectures by scaling coefficients
-        from the Llama-3.1-8B baseline (n_head=32, kv_head=8, head_dim=128).
+    def _scaled_coeffs(self, n_head, kv_head, head_dim):
+        """Return (slope, intercept) in ns for this spec, scaled to the model.
 
-        Scaling formula:
+        Coefficients are fit against the Llama-3.1-8B baseline (n_head=32,
+        kv_head=8, head_dim=128) and scaled to arbitrary architectures:
             slope scales with (n_head / kv_head) — GQA ratio
             intercept scales with (n_head * head_dim) — total KV cache size
-
-        Args:
-            n_head: Number of attention heads
-            kv_head: Number of key-value heads (GQA)
-            head_dim: Dimension per head
-            L: Sequence length
-            channel_split: Memory channel parallelism
-
-        Returns:
-            Latency in nanoseconds
         """
         # Baseline coefficients (Llama-3.1-8B: n_head=32, kv_head=8, head_dim=128)
         attn_model = {
@@ -178,23 +166,66 @@ class PIMModel:
             raise ValueError(f"Unknown PIM spec: {self.spec_name}")
 
         base = attn_model[self.spec_name]
-        base_slope = base["slope"]
-        base_intercept = base["intercept"]
 
         # Baseline model parameters
         BASE_N_HEAD = 32
         BASE_KV_HEAD = 8
         BASE_HEAD_DIM = 128
 
-        # Scale coefficients based on model architecture
         # Slope scales with GQA ratio (more heads = more compute per token)
         gqa_ratio = (n_head / kv_head) / (BASE_N_HEAD / BASE_KV_HEAD)
-
         # Intercept scales with total KV cache size (more heads * dim = more data to load)
         kv_scale = (n_head * head_dim) / (BASE_N_HEAD * BASE_HEAD_DIM)
 
-        slope = base_slope * gqa_ratio
-        intercept = base_intercept * kv_scale
+        slope = base["slope"] * gqa_ratio
+        intercept = base["intercept"] * kv_scale
+        return slope, intercept
 
+    def estimate_with_linear(self, n_head, kv_head, head_dim, L, channel_split=1):
+        """Estimate full PIM attention latency (ns) via the linear model.
+
+        Full decode attention streams the entire KV cache (length ``L``), so
+        latency is bandwidth-bound: ``(slope * L + intercept) / channel_split``.
+        """
+        slope, intercept = self._scaled_coeffs(n_head, kv_head, head_dim)
         return (slope * L + intercept) / channel_split  # float, ns
+
+    def get_sparse_pim_latency(self, n_head, kv_head, head_dim, L,
+                               selection_ratio, nprobe=32, channel_split=1):
+        """Estimate NELSSA sparse decode attention latency (ns).
+
+        Models the two operational modes of the NELSSA PNM compute unit
+        (SK hynix, IEEE CAL 2025) for a single decode request whose KV cache
+        holds ``L`` tokens:
+
+          M2 (sparse attention): attention GEMV over only the top-k selected
+             tokens, ``k = ceil(selection_ratio * L)``. This reuses the same
+             bandwidth-bound linear model as full attention but streams ``k``
+             KV tokens instead of ``L``, carrying the fixed pipeline/setup
+             intercept once.
+          M1 (token selection): IVF vector search over the KV index. Following
+             the paper's sqrt(N) heuristic (Fig. 6), ``n_list = round(sqrt(L))``
+             and the ``nprobe`` probed lists hold ``~nprobe * sqrt(L)`` key
+             vectors. Selection reads keys only (no values), i.e. half the
+             per-token streaming cost of full attention (factor 0.5).
+
+        Args:
+            selection_ratio: fraction of KV tokens kept by sparse attention
+                (e.g. 0.02 for the paper's 2% setting).
+            nprobe: number of IVF lists probed during vector search.
+            channel_split: memory-channel parallelism.
+
+        Returns:
+            (latency_ns, k_selected, vectors_scanned)
+        """
+        slope, intercept = self._scaled_coeffs(n_head, kv_head, head_dim)
+        L = max(1, int(L))
+        k = min(L, max(1, math.ceil(selection_ratio * L)))
+        n_list = max(1, round(math.sqrt(L)))
+        vectors_scanned = min(L, nprobe * math.ceil(L / n_list))
+
+        attn_ns = slope * k + intercept          # M2 sparse attention GEMV
+        select_ns = 0.5 * slope * vectors_scanned  # M1 vector search (keys only)
+        total_ns = (attn_ns + select_ns) / channel_split
+        return total_ns, k, vectors_scanned
 
