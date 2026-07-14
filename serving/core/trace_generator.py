@@ -1001,19 +1001,29 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
     NELSSA GPU-local KV split: when a local window is configured
     (``attention_sink_tokens`` + ``attention_local_window`` > 0), each
     decode request keeps its predictable KVs (attention sinks + recent
-    tokens) on GPU HBM and offloads only the remaining bulk to PIM. GPU
-    local attention runs concurrently with the PIM computation, so the
-    decode-attention latency is modeled as ``max(pim_bulk, gpu_local)``
-    (combining the two partial results has negligible overhead per the
-    paper). With no local window the whole KV goes to PIM, unchanged.
+    tokens) on GPU HBM and offloads only the remaining bulk to PIM.
+
+    The GPU attends *all* decode windows in a single batched operation that
+    overlaps the entire PNM computation (not per request), so the overlap is
+    modeled at the batch level: the PIM lines carry only the PNM bulk work,
+    and the part of the GPU-local batch that is not hidden under the PNM
+    critical path is emitted as one NPU attention node after ``PIM END``.
+    The step's decode-attention latency is then
+    ``pnm_time + max(0, gpu_local_batch - pnm_time) = max(pnm_time,
+    gpu_local_batch)`` (combining the two partial results is negligible per
+    the paper). With no local window the whole KV goes to PIM, unchanged.
     """
     local_w = ctx.attention_sink_tokens + ctx.attention_local_window
+    channel_sums = [0] * ctx.pim_channels  # PNM bulk time per channel (parallel)
+    windows = []                           # per-request GPU-local window sizes
     for ch in range(ctx.pim_channels):
         lines.append(f"PIM {ch}\n")
         for L in bctx.decode_lens[ch]:
             # GPU keeps up to ``local_w`` predictable KVs; PIM handles the bulk.
             w = min(L, local_w) if local_w > 0 else 0
             L_remote = L - w
+            if w > 0:
+                windows.append(w)
 
             # Per-token Q/O activation sizes are independent of L (one decode
             # query, one output); the KV-streaming cost lives in ``pim_lat``.
@@ -1036,27 +1046,39 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
                 pim_bulk_ns = ctx.pim_model.get_pim_latency(
                     ctx.n_head, ctx.kv_head, ctx.head_dim, L_remote, bctx.channel_split)
 
-            # GPU-local attention over the predictable window (HBM), overlapped.
-            gpu_local_ns = 0
-            if w > 0:
-                gpu_local_ns = _lookup_attention_with_skew(
-                    ctx.perf_db, ctx.tp_size, 0, 0, 1, w, w, w)
-
-            pim_lat = max(1, int(max(pim_bulk_ns, gpu_local_ns)))
+            pim_lat = max(1, int(pim_bulk_ns))
             lines.append(formatter("attention", str(pim_lat),
                 f'REMOTE:{ctx.node_id}.{ch}', str(inp),
                 get_device(ctx.placement, layer_num, "attention", "weights"), '0',
                 f'REMOTE:{ctx.node_id}.{ch}', str(out),
                 'NONE', '0', batch_tag))
-            if power_acc is not None:
-                # PIM and GPU energy are tracked on their own devices even
-                # though their latencies overlap on the critical path.
-                if pim_bulk_ns > 0:
-                    power_acc.pim_latencies_ns.append(int(pim_bulk_ns))
-                    power_acc.dram_weight_bytes += inp + out
-                if gpu_local_ns > 0:
-                    power_acc.npu_latencies_ns.append(int(gpu_local_ns))
+            channel_sums[ch] += pim_lat
+            if power_acc is not None and pim_bulk_ns > 0:
+                power_acc.pim_latencies_ns.append(int(pim_bulk_ns))
+                power_acc.dram_weight_bytes += inp + out
     lines.append("PIM END\n")
+
+    # Batch-level GPU-local overlap: one batched NPU attention over all decode
+    # windows, hidden under the PNM critical path; only the un-hidden residual
+    # extends the step (emitted as a serial NPU node so the running total lands
+    # at max(pnm_time, gpu_local_batch)).
+    if windows:
+        n_dec = len(windows)
+        w_mean = max(1, sum(windows) // n_dec)
+        gpu_local_batch = _lookup_attention_with_skew(
+            ctx.perf_db, ctx.tp_size, 0, 0, n_dec, w_mean, w_mean, w_mean)
+        pnm_time = max(channel_sums) if channel_sums else 0
+        residual = max(0, int(gpu_local_batch) - pnm_time)
+        if residual > 0:
+            inp, _, out = calculate_sizes(ctx.model, "attention", n_dec,
+                                          kv_len=sum(windows), parallel=ctx.tp_size, fp=ctx.fp)
+            lines.append(formatter("attention", str(residual),
+                'LOCAL', str(inp),
+                get_device(ctx.placement, layer_num, "attention", "weights"), '0',
+                'LOCAL', str(out),
+                'NONE', '0', batch_tag))
+        if power_acc is not None:
+            power_acc.npu_latencies_ns.append(int(gpu_local_batch))
 
 
 def _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):

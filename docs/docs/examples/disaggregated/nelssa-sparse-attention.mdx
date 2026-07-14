@@ -111,12 +111,23 @@ python -m serving \
 ```
 
 For each decode request of KV length `L`, the GPU handles a window of
-`w = sink + recent` tokens and PIM handles the bulk `L − w`; the
-decode-attention latency is `max(pim_bulk(L − w), gpu_local(w))`. At
-multi-million-token scale `w ≪ L`, so PIM stays the critical path and the
-split mainly guarantees the predictable tokens are always attended
-(accuracy) rather than changing latency. For shorter sequences that fit
-inside the window, attention runs entirely on GPU HBM and is faster.
+`w = sink + recent` tokens and PIM handles the bulk `L − w`. The GPU
+attends *all* decode windows in one batched operation that overlaps the
+whole PNM phase, so the overlap is modeled at the batch level:
+
+```
+decode_attention_latency = max(pnm_time, gpu_local_batch)
+```
+
+where `pnm_time` is the busiest PIM channel's summed bulk work and
+`gpu_local_batch` is a single batched NPU attention over every decode
+window. In the trace this is emitted as pure-bulk PIM lines plus one NPU
+node carrying only the residual `max(0, gpu_local_batch − pnm_time)`, so
+the GPU work is never serialized per request. At multi-million-token scale
+`w ≪ L`, so PIM stays the critical path and the split mainly guarantees the
+predictable tokens are always attended (accuracy) rather than changing
+latency. For shorter sequences that fit inside the window, attention runs
+entirely on GPU HBM and is faster.
 
 ## The model
 
@@ -149,14 +160,17 @@ Both live in `serving/core/pim_model.py::get_sparse_pim_latency`.
 
 ## Modeling notes
 
-- **Concurrency as `max`.** The GPU-local and PNM attentions overlap, so
-  the step's decode-attention latency is `max(pim_bulk, gpu_local)` rather
-  than their sum, with the result-combine treated as negligible (per the
-  paper). PIM and GPU energy are still tracked on their own devices.
-- **What's not modeled yet.** Per-request `max` is used instead of a
-  batch-level GPU/PNM overlap, and the RetrievalAttention index build cost
-  during prefill is treated as an amortized upfront cost, not simulated
-  per step. These are refinements on top of the current model.
+- **Batch-level concurrency.** The GPU-local and PNM attentions overlap, so
+  the step's decode-attention latency is `max(pnm_time, gpu_local_batch)`
+  rather than their sum. The GPU work is a single batched attention over all
+  decode windows (not serialized per request), and only its un-hidden
+  residual is added to the critical path. The result-combine is treated as
+  negligible (per the paper). PIM and GPU energy are still tracked on their
+  own devices.
+- **What's not modeled yet.** The RetrievalAttention index build cost during
+  prefill is treated as an amortized upfront cost, not simulated per step;
+  the GPU-local batch uses the mean window across decodes as its `kv_decode`
+  key. These are refinements on top of the current model.
 
 ## Where to learn more
 
