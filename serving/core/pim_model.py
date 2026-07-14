@@ -104,6 +104,13 @@ class PIMModel:
         tCK = pim_config["tCK"]
         self.read_latency = CL * tCK
 
+        # Compute-side throughput of the PNM engine, expressed via operational
+        # intensity (FLOPs/byte). NELSSA sizes the compute engine to *saturate*
+        # the module's bandwidth (OI ~= 8 -> ~1.6 TFLOPS at 200 GB/s), so
+        # peak_flops = mem_bw x OI. Used for compute-bound work like the
+        # RetrievalAttention index build. Overridable via the .ini.
+        self.operational_intensity = pim_config.get("operational_intensity", 8.0)
+
     def get_config(self):
         return {"mem_size": self.mem_size, 
                 "mem_bw": self.mem_bw,
@@ -119,6 +126,35 @@ class PIMModel:
     
     def get_pim_latency(self, n_head, kv_head, head_dim, L, channel_split=1):
         return self.estimate_with_linear(n_head, kv_head, head_dim, L, channel_split) # ns
+
+    def get_index_build_latency(self, head_dim, n_new_tokens, kv_size):
+        """Estimate the RetrievalAttention vector-index build cost (ns).
+
+        NELSSA builds a per-layer IVF index over the prefilled KV cache and
+        offloads it to the PNM modules -- a one-time upfront cost at prefill
+        (SK hynix, IEEE CAL 2025). Inserting ``n_new_tokens`` key vectors into
+        an IVF index with ``n_list = round(sqrt(kv_size))`` centroids costs one
+        ``head_dim``-wide distance per (vector, centroid) pair. This is
+        compute-bound, so it is sized by the module's compute throughput
+        ``peak_flops = mem_bw x operational_intensity`` (the same bandwidth-
+        saturating engine the paper describes), not by memory streaming.
+
+        Args:
+            head_dim: per-head dimension of the indexed key vectors.
+            n_new_tokens: KV vectors added to the index this step.
+            kv_size: total KV length backing the index (sets n_list).
+
+        Returns:
+            Latency in nanoseconds.
+        """
+        n_new = max(0, int(n_new_tokens))
+        if n_new == 0:
+            return 0.0
+        n_list = max(1, round(math.sqrt(max(1, int(kv_size)))))
+        macs = n_new * n_list * head_dim               # head_dim-wide distances
+        peak_flops = self.mem_bw * 1e9 * self.operational_intensity  # bytes/s * FLOPs/byte
+        peak_macs = peak_flops / 2.0                   # 1 MAC = 2 FLOPs
+        return macs / peak_macs * 1e9                  # ns
 
     def _scaled_coeffs(self, n_head, kv_head, head_dim):
         """Return (slope, intercept) in ns for this spec, scaled to the model.

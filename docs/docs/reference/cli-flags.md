@@ -61,6 +61,7 @@ matching runtime knobs per `instances[i]`; see
 | `--sparse-vector-search-nprobe` | `32` | IVF lists probed during NELSSA token selection (vector search) |
 | `--attention-local-window` | `0` | NELSSA GPU-local KV split: recent decode tokens kept in GPU HBM and attended on GPU, overlapping PIM bulk attention. Requires `--enable-attn-offloading` |
 | `--attention-sink-tokens` | `0` | NELSSA GPU-local KV split: leading attention-sink tokens kept in GPU HBM (added to the local window). Requires `--enable-attn-offloading` |
+| `--sparse-index-build` / `--no-sparse-index-build` | on | Model the RetrievalAttention vector-index build cost at prefill (per layer, on the PNM module). Only applies when `--sparse-attention-ratio` is set |
 
 ## Dataset and output
 

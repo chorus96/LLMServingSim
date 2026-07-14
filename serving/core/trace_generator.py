@@ -1,5 +1,6 @@
 import os
 import re
+import math
 from .request import *
 from .utils import *
 import pandas as pd
@@ -115,6 +116,7 @@ class TraceCtx:
     sparse_vector_search_nprobe: int = 32  # IVF lists probed during token selection (M1)
     attention_local_window: int = 0  # NELSSA GPU-local KV split: recent decode tokens kept on GPU HBM (0 = all decode KV on PIM)
     attention_sink_tokens: int = 0  # NELSSA GPU-local KV split: leading attention-sink tokens kept on GPU HBM
+    sparse_index_build: bool = True  # NELSSA: model the RetrievalAttention vector-index build cost at prefill (only when sparse attention is active)
 
 
 @dataclass
@@ -836,7 +838,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
                      sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
-                     attention_local_window=0, attention_sink_tokens=0):
+                     attention_local_window=0, attention_sink_tokens=0,
+                     sparse_index_build=True):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -873,6 +876,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         sparse_vector_search_nprobe=sparse_vector_search_nprobe,
         attention_local_window=attention_local_window,
         attention_sink_tokens=attention_sink_tokens,
+        sparse_index_build=sparse_index_build,
     )
 
 
@@ -1081,6 +1085,40 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
             power_acc.npu_latencies_ns.append(int(gpu_local_batch))
 
 
+def _emit_pim_index_build(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
+    """Emit the RetrievalAttention vector-index build for prefilled KV (NELSSA).
+
+    A one-time upfront cost at prefill: the newly prefilled KV vectors are
+    inserted into this layer's IVF index on the PNM module. Fires only on
+    prefill steps (``prefill_chunk > 0``); decode steps add no new KV to index.
+
+    Emitted as a plain compute node in the prefill chain (not a ``PIM`` block):
+    the Chakra converter assumes PIM blocks only ever appear in decode, so a
+    prefill PIM block would break dependency linking. The latency therefore
+    lands on the prefill critical path as a serial upfront cost (which is how
+    the paper treats it); its energy is still attributed to the PNM engine.
+    Per-layer, so it replicates with the transformer block.
+    """
+    n_new = bctx.prefill_chunk
+    if n_new <= 0:
+        return
+    kv_size = bctx.kv_prefill + bctx.prefill_chunk
+    lat = int(ctx.pim_model.get_index_build_latency(ctx.head_dim, n_new, kv_size))
+    if lat <= 0:
+        return
+    n_list = max(1, round(math.sqrt(max(1, kv_size))))
+    inp = n_new * ctx.head_dim * ctx.fp     # key vectors indexed this step
+    out = n_list * ctx.head_dim * ctx.fp    # IVF centroids written
+    lines.append(formatter("index_build", str(lat),
+        'LOCAL', str(inp),
+        get_device(ctx.placement, layer_num, "attention", "weights"), '0',
+        'LOCAL', str(out),
+        'NONE', '0', batch_tag))
+    if power_acc is not None:
+        power_acc.pim_latencies_ns.append(lat)  # compute runs on the PNM engine
+        power_acc.dram_weight_bytes += inp + out
+
+
 def _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
     """Emit NPU attention (unified prefill+decode lookup)."""
     if bctx.prefill_chunk == 0 and bctx.n_decode == 0:
@@ -1230,6 +1268,9 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
         if layer_name == "attention":
             if ctx.enable_attn_offloading:
                 _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
+                # NELSSA: build the RetrievalAttention index for prefilled KV.
+                if ctx.sparse_attention_ratio is not None and ctx.sparse_index_build:
+                    _emit_pim_index_build(ctx, bctx, lines, power_acc, layer_num, batch_tag)
             _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
             continue
         if layer_name == "rotary_emb" and "TPU" in ctx.hardware:
@@ -1374,7 +1415,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                       tp_dim=None, ep_dim=None, dp_sum_total_len=0,
                       sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
-                      attention_local_window=0, attention_sink_tokens=0):
+                      attention_local_window=0, attention_sink_tokens=0,
+                      sparse_index_build=True):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1384,7 +1426,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            sparse_attention_ratio=sparse_attention_ratio,
                            sparse_vector_search_nprobe=sparse_vector_search_nprobe,
                            attention_local_window=attention_local_window,
-                           attention_sink_tokens=attention_sink_tokens)
+                           attention_sink_tokens=attention_sink_tokens,
+                           sparse_index_build=sparse_index_build)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1433,7 +1476,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                                   tp_dim=None, ep_dim=None, dp_sum_total_len=0,
                                   sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
-                                  attention_local_window=0, attention_sink_tokens=0):
+                                  attention_local_window=0, attention_sink_tokens=0,
+                                  sparse_index_build=True):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1443,7 +1487,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            sparse_attention_ratio=sparse_attention_ratio,
                            sparse_vector_search_nprobe=sparse_vector_search_nprobe,
                            attention_local_window=attention_local_window,
-                           attention_sink_tokens=attention_sink_tokens)
+                           attention_sink_tokens=attention_sink_tokens,
+                           sparse_index_build=sparse_index_build)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1540,7 +1585,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
                    tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
                    sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
-                   attention_local_window=0, attention_sink_tokens=0):
+                   attention_local_window=0, attention_sink_tokens=0,
+                   sparse_index_build=True):
 
     model = batch.model
     config = get_config(model)
@@ -1595,7 +1641,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         sparse_attention_ratio=sparse_attention_ratio,
                         sparse_vector_search_nprobe=sparse_vector_search_nprobe,
                         attention_local_window=attention_local_window,
-                        attention_sink_tokens=attention_sink_tokens)
+                        attention_sink_tokens=attention_sink_tokens,
+                        sparse_index_build=sparse_index_build)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:

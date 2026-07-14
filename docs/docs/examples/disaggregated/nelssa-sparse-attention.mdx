@@ -91,6 +91,7 @@ for an A/B comparison on identical hardware.
 | `--sparse-vector-search-nprobe` | IVF lists probed during token selection (vector search). Higher = more recall and higher selection cost. Default `32`. |
 | `--attention-local-window` | Recent decode tokens kept in GPU HBM and attended on the GPU (overlapping PIM). Default `0` (all decode KV on PIM). |
 | `--attention-sink-tokens` | Leading attention-sink tokens kept in GPU HBM (added to the local window). Default `0`. |
+| `--sparse-index-build` / `--no-sparse-index-build` | Model the RetrievalAttention vector-index build at prefill. Default on (only active with a sparse ratio). |
 
 ### GPU-local KV split (recent + sink window)
 
@@ -143,6 +144,23 @@ latency becomes (per the two NELSSA compute-unit modes):
   per-token streaming of full attention).
 
 Both live in `serving/core/pim_model.py::get_sparse_pim_latency`.
+
+### Index build (prefill, upfront)
+
+RetrievalAttention builds a per-layer IVF vector index over the prefilled
+KV cache and offloads it to the PNM modules — a one-time upfront cost at
+prefill (`--sparse-index-build`, on by default when a sparse ratio is set;
+disable with `--no-sparse-index-build`). Inserting the new KV vectors into
+an index with `n_list = round(sqrt(kv_size))` centroids costs one
+`head_dim`-wide distance per (vector, centroid) pair, i.e. `O(N^1.5)` over
+the sequence. This is **compute-bound**, so it is sized by the PNM engine's
+throughput `peak_flops = mem_bw × operational_intensity` (the DDR5 module's
+`operational_intensity = 8` gives ~1.6 TFLOPS at 204.8 GB/s — exactly the
+paper's bandwidth-saturating engine). It lands on the **prefill critical
+path** (raising TTFT), not on decode. It is negligible for short prompts
+(~10 ms of TTFT at a 20K-token prompt on Llama-3.1-8B) and grows toward
+seconds for multi-million-token prompts — an upfront cost amortized over
+the whole decode. Model: `serving/core/pim_model.py::get_index_build_latency`.
 
 ## What's interesting
 
@@ -200,10 +218,15 @@ To swap in a real measured profile, follow
   residual is added to the critical path. The result-combine is treated as
   negligible (per the paper). PIM and GPU energy are still tracked on their
   own devices.
-- **What's not modeled yet.** The RetrievalAttention index build cost during
-  prefill is treated as an amortized upfront cost, not simulated per step;
-  the GPU-local batch uses the mean window across decodes as its `kv_decode`
-  key. These are refinements on top of the current model.
+- **Index build is on the prefill critical path.** The RetrievalAttention
+  index build is emitted as a per-layer compute node during prefill (raising
+  TTFT), sized by the PNM compute engine. Because the Chakra converter
+  assumes PIM blocks only appear in decode, it is emitted as a compute node
+  rather than a PIM block; its energy is still attributed to the PNM engine.
+- **What's not modeled yet.** The GPU-local batch uses the mean window across
+  decodes as its `kv_decode` key, and the index build uses batch-summed
+  `prefill_chunk` / `kv_size` (rather than per-request) for its `n_list`.
+  These are refinements on top of the current model.
 
 ## Where to learn more
 

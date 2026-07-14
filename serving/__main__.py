@@ -217,6 +217,7 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "sparse_vector_search_nprobe": sparse_vector_search_nprobe,
             "attention_local_window": attention_local_window,
             "attention_sink_tokens": attention_sink_tokens,
+            "sparse_index_build": instance.get("sparse_index_build", args.sparse_index_build),
         })
     return runtime_configs
 
@@ -304,6 +305,10 @@ def main():
                         help='NELSSA GPU-local KV split: number of leading attention-sink tokens '
                         'kept in GPU HBM (added to --attention-local-window). Requires '
                         '--enable-attn-offloading')
+    parser.add_argument('--sparse-index-build', action=argparse.BooleanOptionalAction, default=True,
+                        help='NELSSA: model the RetrievalAttention vector-index build cost at '
+                        'prefill (per layer, on the PNM module). Only applies when '
+                        '--sparse-attention-ratio is set. Default: enabled')
     parser.add_argument('--prioritize-prefill', action='store_true', default=False,
                         help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
@@ -708,6 +713,7 @@ def main():
                                        sparse_vector_search_nprobe=inst_cfg["sparse_vector_search_nprobe"],
                                        attention_local_window=inst_cfg["attention_local_window"],
                                        attention_sink_tokens=inst_cfg["attention_sink_tokens"],
+                                       sparse_index_build=inst_cfg["sparse_index_build"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -779,6 +785,7 @@ def main():
                                            sparse_vector_search_nprobe=inst_cfg["sparse_vector_search_nprobe"],
                                            attention_local_window=inst_cfg["attention_local_window"],
                                            attention_sink_tokens=inst_cfg["attention_sink_tokens"],
+                                           sparse_index_build=inst_cfg["sparse_index_build"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -819,6 +826,7 @@ def main():
                                    sparse_vector_search_nprobe=inst_cfg["sparse_vector_search_nprobe"],
                                    attention_local_window=inst_cfg["attention_local_window"],
                                    attention_sink_tokens=inst_cfg["attention_sink_tokens"],
+                                   sparse_index_build=inst_cfg["sparse_index_build"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
