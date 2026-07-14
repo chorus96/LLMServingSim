@@ -83,6 +83,48 @@ python -m serving \
 Drop `--sparse-attention-ratio` to get the full-attention HC-PNM baseline
 for an A/B comparison on identical hardware.
 
+## Baselines: HC-PNM vs the CXL-PNM (HB-PNM) baseline
+
+NELSSA compares its HC-PNM (`--no`-sparse = Hermes) against a **CXL-PNM [4]
+baseline** — an *HB-PNM* (High-Bandwidth PNM) module: stacked LPDDR5X,
+~1.1 TB/s (≈5.5× the HC-PNM DDR5 module) but only **128 GB**. Its config,
+`configs/cluster/single_node_cxlpnm_baseline_instance.json`, uses the
+`LPDDR5_HBPNM_128GB_pim` device and runs **full** attention (no sparse
+ratio):
+
+```bash
+python -m serving \
+  --cluster-config 'configs/cluster/single_node_cxlpnm_baseline_instance.json' \
+  --dtype bfloat16 --enable-attn-offloading \
+  --dataset 'workloads/example_trace.jsonl' \
+  --output 'outputs/cxlpnm.csv' --log-level WARNING
+```
+
+Three arms on the same model/hardware (short-context smoke test,
+Llama-3.1-8B, per-token TPOT):
+
+| Arm | Device | Attention | TPOT |
+| --- | --- | --- | --- |
+| CXL-PNM [4] (HB-PNM) | LPDDR5X, 1.1 TB/s, **128 GB** | full | 14.9 ms |
+| HC-PNM full (Hermes) | DDR5, 200 GB/s, 1 TB | full | 29.6 ms |
+| NELSSA | DDR5, 200 GB/s, 1 TB | sparse 2% | 19.0 ms |
+
+This reproduces the paper's trade-off: the HB-PNM's bandwidth makes full
+attention **fast per token** at short context, but its **128 GB capacity**
+caps sequence length — long-context runs OOM (the paper's Fig. 5 'X'
+markers), which is exactly where NELSSA's 1 TB HC-PNM + sparsity keeps
+running.
+
+:::note Modeling the capacity limit
+The simulator bounds the KV cache by the KV budget `npu_mem − weight`. To
+model the HB-PNM's 128 GB KV capacity (and its OOM boundary), set
+`npu_mem = weight + 128` in the config; a sequence whose KV exceeds the
+budget stalls/OOMs (for Llama-70B, 128 GB ≈ 400K tokens vs the HC-PNM's
+1 TB ≈ 3.2M). The device **bandwidth** is modeled by the PNM attention
+coefficients; the **capacity** by the KV budget. Both PNM baselines share
+the same PCIe 5.0 interconnect (`link_bw: 64`), matching the paper.
+:::
+
 ## Flags
 
 | Flag | Meaning |

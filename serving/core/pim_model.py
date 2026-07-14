@@ -196,6 +196,19 @@ class PIMModel:
                 "slope": 166.6269,
                 "intercept": 27665.40
             },
+            # HB-PNM module (stacked LPDDR5X, ~1.1 TB/s, 128 GB) -- the CXL-PNM
+            # [4] baseline in NELSSA (full attention on high-bandwidth PNM).
+            # Derived from DDR5_1TB_6400_pim by aggregate-bandwidth ratio (full
+            # attention streams the whole KV at the module's aggregate BW):
+            #   slope     = 166.6269 * (204.8 / 1092.2) = 31.2438
+            #   intercept = 27665.40 * (9.376 / 12.5)   = 20751.26  (read latency)
+            # ~5.5x the DDR5 bandwidth -> ~5.5x lower per-token slope, so full
+            # attention here is fast; the module's weakness is its 128 GB
+            # capacity (modeled via the KV budget in the cluster config).
+            "LPDDR5_HBPNM_128GB_pim": {
+                "slope": 31.2438,
+                "intercept": 20751.26
+            },
         }
 
         if self.spec_name not in attn_model:

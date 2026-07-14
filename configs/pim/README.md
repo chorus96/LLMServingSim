@@ -15,6 +15,7 @@ passing `--enable-attn-offloading` to `python -m serving`.
 | `LPDDR4X_2GB_4266_pim.ini` | LPDDR4X | 2 GB | 4266 MT/s | LPDDR4X PIM module |
 | `LPDDR5_2GB_6400_pim.ini` | LPDDR5 | 2 GB | 6400 MT/s | LPDDR5 PIM module |
 | `DDR5_1TB_6400_pim.ini` | DDR5 | 1 TB | 6400 MT/s | NELSSA HC-PNM module (4-CH, ~200 GB/s) |
+| `LPDDR5_HBPNM_128GB_pim.ini` | LPDDR5X | 128 GB | 8533 MT/s | HB-PNM module / CXL-PNM [4] baseline (~1.1 TB/s, capacity-limited) |
 
 ## Key parameters
 
