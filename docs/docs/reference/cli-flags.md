@@ -59,6 +59,8 @@ matching runtime knobs per `instances[i]`; see
 | `--enable-sub-batch-interleaving` | off | Overlap GPU compute with PIM attention. Requires `--enable-attn-offloading` |
 | `--sparse-attention-ratio` | `None` | NELSSA dynamic sparse attention: fraction of KV tokens kept per decode step (e.g. `0.02`). Requires `--enable-attn-offloading` |
 | `--sparse-vector-search-nprobe` | `32` | IVF lists probed during NELSSA token selection (vector search) |
+| `--attention-local-window` | `0` | NELSSA GPU-local KV split: recent decode tokens kept in GPU HBM and attended on GPU, overlapping PIM bulk attention. Requires `--enable-attn-offloading` |
+| `--attention-sink-tokens` | `0` | NELSSA GPU-local KV split: leading attention-sink tokens kept in GPU HBM (added to the local window). Requires `--enable-attn-offloading` |
 
 ## Dataset and output
 

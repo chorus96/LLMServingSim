@@ -180,6 +180,19 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
                     f"Instance {instance_id} sparse_attention_ratio must be in (0, 1], "
                     f"got {sparse_attention_ratio}")
 
+        attention_local_window = instance.get(
+            "attention_local_window", args.attention_local_window)
+        attention_sink_tokens = instance.get(
+            "attention_sink_tokens", args.attention_sink_tokens)
+        if attention_local_window < 0 or attention_sink_tokens < 0:
+            raise ValueError(
+                f"Instance {instance_id} attention_local_window / attention_sink_tokens "
+                f"must be non-negative")
+        if (attention_local_window > 0 or attention_sink_tokens > 0) and not enable_attn_offloading:
+            raise RuntimeError(
+                f"Instance {instance_id} sets a GPU-local attention window without attention "
+                f"offloading; the NELSSA KV split needs PIM (--enable-attn-offloading)")
+
         runtime_configs.append({
             "max_num_seqs": _runtime_limit(instance.get("max_num_seqs", args.max_num_seqs)),
             "max_num_batched_tokens": _runtime_limit(
@@ -202,6 +215,8 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
             "sparse_attention_ratio": sparse_attention_ratio,
             "sparse_vector_search_nprobe": sparse_vector_search_nprobe,
+            "attention_local_window": attention_local_window,
+            "attention_sink_tokens": attention_sink_tokens,
         })
     return runtime_configs
 
@@ -281,6 +296,14 @@ def main():
     parser.add_argument('--sparse-vector-search-nprobe', type=int, default=32,
                         help='number of IVF lists probed during NELSSA token selection (vector '
                         'search). Higher = more recall and higher selection cost. Default: 32')
+    parser.add_argument('--attention-local-window', type=int, default=0,
+                        help='NELSSA GPU-local KV split: number of recent decode tokens kept in '
+                        'GPU HBM and attended on the GPU, overlapping the PIM bulk attention. '
+                        '0 = all decode KV on PIM. Requires --enable-attn-offloading')
+    parser.add_argument('--attention-sink-tokens', type=int, default=0,
+                        help='NELSSA GPU-local KV split: number of leading attention-sink tokens '
+                        'kept in GPU HBM (added to --attention-local-window). Requires '
+                        '--enable-attn-offloading')
     parser.add_argument('--prioritize-prefill', action='store_true', default=False,
                         help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
@@ -683,6 +706,8 @@ def main():
                                        enable_block_copy=inst_cfg["enable_block_copy"],
                                        sparse_attention_ratio=inst_cfg["sparse_attention_ratio"],
                                        sparse_vector_search_nprobe=inst_cfg["sparse_vector_search_nprobe"],
+                                       attention_local_window=inst_cfg["attention_local_window"],
+                                       attention_sink_tokens=inst_cfg["attention_sink_tokens"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -752,6 +777,8 @@ def main():
                                            enable_block_copy=inst_cfg["enable_block_copy"],
                                            sparse_attention_ratio=inst_cfg["sparse_attention_ratio"],
                                            sparse_vector_search_nprobe=inst_cfg["sparse_vector_search_nprobe"],
+                                           attention_local_window=inst_cfg["attention_local_window"],
+                                           attention_sink_tokens=inst_cfg["attention_sink_tokens"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -790,6 +817,8 @@ def main():
                                    enable_block_copy=inst_cfg["enable_block_copy"],
                                    sparse_attention_ratio=inst_cfg["sparse_attention_ratio"],
                                    sparse_vector_search_nprobe=inst_cfg["sparse_vector_search_nprobe"],
+                                   attention_local_window=inst_cfg["attention_local_window"],
+                                   attention_sink_tokens=inst_cfg["attention_sink_tokens"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
