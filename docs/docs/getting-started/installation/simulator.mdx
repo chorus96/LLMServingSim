@@ -86,6 +86,25 @@ the ns3 backend (cycle-accurate network simulation). Most users
 don't need this. Uncomment it only if you set `--network-backend ns3`.
 :::
 
+## Bare-metal setup (no Docker)
+
+Prefer to run directly on the host instead of the container? Use the
+one-shot installer, which does the equivalent of the steps above —
+initializes the ASTRA-Sim submodule, installs the C++ toolchain
+(`cmake`, `g++`, `protobuf-compiler`, `libprotobuf-dev`) and the Python
+deps, builds ASTRA-Sim + Chakra, and aligns the protobuf runtime with
+Chakra's generated code:
+
+```bash
+./scripts/install-sim.sh
+```
+
+Installing the system packages needs root, so run with `sudo` (or as
+root), or pre-install those packages yourself. When it finishes it
+prints a ready-to-run `python -m serving …` command. After that, skip to
+**Verify the install** below — everything else is identical to the
+container path.
+
 ## 4. Verify the install
 
 Run the bundled smoke test from inside the simulator container:
