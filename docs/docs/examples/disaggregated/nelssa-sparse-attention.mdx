@@ -209,6 +209,7 @@ tier, backs off instead. Without offloading, the budget stays the ordinary
 | `--attention-sink-tokens` | Leading attention-sink tokens kept in GPU HBM (added to the local window). Default `0`. |
 | `--sparse-index-build` / `--no-sparse-index-build` | Model the RetrievalAttention vector-index build at prefill. Default on (only active with a sparse ratio). |
 | `--sparse-index-footprint-ratio` | Vector-index memory as a fraction of the KV cache (stored on the PNM, reduces KV capacity). Default `0.10`; `0` disables. Sparse mode only. |
+| `--pnm-combine-comm` / `--no-pnm-combine-comm` | Model the decode-attention combine transfer (query down + partial results up over the PNM interconnect). Default on with offloading. |
 
 ### GPU-local KV split (recent + sink window)
 
@@ -339,9 +340,15 @@ To swap in a real measured profile, follow
   the step's decode-attention latency is `max(pnm_time, gpu_local_batch)`
   rather than their sum. The GPU work is a single batched attention over all
   decode windows (not serialized per request), and only its un-hidden
-  residual is added to the critical path. The result-combine is treated as
-  negligible (per the paper). PIM and GPU energy are still tracked on their
-  own devices.
+  residual is added to the critical path. PIM and GPU energy are still
+  tracked on their own devices.
+- **Combine transfer (`--pnm-combine-comm`).** The paper's workflow sends the
+  query down to the PNM and reads the partial results (+ softmax LSE) back up
+  over the interconnect before merging. Modeled as a per-layer serial NPU node
+  whose time is that query+result round-trip over `link_bw` (the PCIe/CXL
+  link, distinct from the PNM's internal bandwidth); the merge compute itself
+  is negligible per the paper. Small at low concurrency, it grows with the
+  decode batch — e.g. ~0.24 ms of TPOT on an 8-request Llama-3.1-8B batch.
 - **Index build is on the prefill critical path.** The RetrievalAttention
   index build is emitted as a per-layer compute node during prefill (raising
   TTFT), sized by the PNM compute engine. Because the Chakra converter

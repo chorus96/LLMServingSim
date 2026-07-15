@@ -222,6 +222,7 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "sparse_index_footprint_ratio": (
                 instance.get("sparse_index_footprint_ratio", args.sparse_index_footprint_ratio)
                 if sparse_attention_ratio is not None else 0.0),
+            "pnm_combine_comm": instance.get("pnm_combine_comm", args.pnm_combine_comm),
         })
     return runtime_configs
 
@@ -318,6 +319,11 @@ def main():
                         'fraction of the KV cache size (the index is stored on the PNM alongside '
                         'the KV, reducing effective KV capacity). Only applies when '
                         '--sparse-attention-ratio is set. 0 disables. Default: 0.10')
+    parser.add_argument('--pnm-combine-comm', action=argparse.BooleanOptionalAction, default=True,
+                        help='NELSSA: model the decode-attention combine transfer — the GPU sends '
+                        'each query down to the PNM and reads the partial results back over the '
+                        'interconnect (link_bw), then merges them. Only applies with '
+                        '--enable-attn-offloading. Default: enabled')
     parser.add_argument('--prioritize-prefill', action='store_true', default=False,
                         help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
@@ -406,6 +412,7 @@ def main():
     power_configs = cluster["power_configs"]
     pim_models = cluster["pim_models"]
     pim_on_cxl = cluster.get("pim_on_cxl", False)
+    link_bw = cluster.get("link_bw", 0)
     instance_runtime_configs = _build_instance_runtime_configs(instances, args, _dtype_to_bits)
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
     # ----------------------------------------- Set config -----------------------------------------
@@ -728,6 +735,7 @@ def main():
                                        attention_sink_tokens=inst_cfg["attention_sink_tokens"],
                                        sparse_index_build=inst_cfg["sparse_index_build"],
                                        pim_on_cxl=pim_on_cxl,
+                                       link_bw=link_bw, pnm_combine_comm=inst_cfg["pnm_combine_comm"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -801,6 +809,7 @@ def main():
                                            attention_sink_tokens=inst_cfg["attention_sink_tokens"],
                                            sparse_index_build=inst_cfg["sparse_index_build"],
                                            pim_on_cxl=pim_on_cxl,
+                                           link_bw=link_bw, pnm_combine_comm=inst_cfg["pnm_combine_comm"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -843,6 +852,7 @@ def main():
                                    attention_sink_tokens=inst_cfg["attention_sink_tokens"],
                                    sparse_index_build=inst_cfg["sparse_index_build"],
                                    pim_on_cxl=pim_on_cxl,
+                                   link_bw=link_bw, pnm_combine_comm=inst_cfg["pnm_combine_comm"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

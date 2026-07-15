@@ -63,6 +63,7 @@ matching runtime knobs per `instances[i]`; see
 | `--attention-sink-tokens` | `0` | NELSSA GPU-local KV split: leading attention-sink tokens kept in GPU HBM (added to the local window). Requires `--enable-attn-offloading` |
 | `--sparse-index-build` / `--no-sparse-index-build` | on | Model the RetrievalAttention vector-index build cost at prefill (per layer, on the PNM module). Only applies when `--sparse-attention-ratio` is set |
 | `--sparse-index-footprint-ratio` | `0.10` | RetrievalAttention vector-index memory footprint as a fraction of the KV cache (stored on the PNM, reduces effective KV capacity). `0` disables. Sparse mode only |
+| `--pnm-combine-comm` / `--no-pnm-combine-comm` | on | Model the decode-attention combine transfer: query sent down to the PNM + partial results read back over the interconnect (`link_bw`). Requires `--enable-attn-offloading` |
 
 ## Dataset and output
 
