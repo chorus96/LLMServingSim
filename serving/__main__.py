@@ -193,6 +193,16 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
                 f"Instance {instance_id} sets a GPU-local attention window without attention "
                 f"offloading; the NELSSA KV split needs PIM (--enable-attn-offloading)")
 
+        hermes_hot_ratio = instance.get("hermes_hot_ratio", args.hermes_hot_ratio)
+        if hermes_hot_ratio is not None:
+            if not enable_attn_offloading:
+                raise RuntimeError(
+                    f"Instance {instance_id} sets hermes_hot_ratio without attention offloading; "
+                    f"the Hermes cold FFN runs on the NDP-DIMM (--enable-attn-offloading)")
+            if not (0.0 < hermes_hot_ratio <= 1.0):
+                raise ValueError(
+                    f"Instance {instance_id} hermes_hot_ratio must be in (0, 1], got {hermes_hot_ratio}")
+
         runtime_configs.append({
             "max_num_seqs": _runtime_limit(instance.get("max_num_seqs", args.max_num_seqs)),
             "max_num_batched_tokens": _runtime_limit(
@@ -225,6 +235,8 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "pnm_combine_comm": instance.get("pnm_combine_comm", args.pnm_combine_comm),
             "pnm_kv_seq_partition": instance.get("pnm_kv_seq_partition", args.pnm_kv_seq_partition),
             "num_pnm_modules": instance.get("num_pnm_modules", args.pnm_modules),
+            "hermes_hot_ratio": hermes_hot_ratio,
+            "hermes_cold_activation": instance.get("hermes_cold_activation", args.hermes_cold_activation),
         })
     return runtime_configs
 
@@ -335,6 +347,15 @@ def main():
     parser.add_argument('--pnm-modules', type=int, default=1,
                         help='NELSSA: number of PNM modules. Scales the combine interconnect '
                         'bandwidth (each module has its own link). Default: 1')
+    parser.add_argument('--hermes-hot-ratio', type=float, default=None,
+                        help='Hermes baseline: fraction of FFN neurons kept hot on the GPU; the '
+                        'cold rest is offloaded to the NDP-DIMM (PNM) and computed near-data. '
+                        'Enables the Hermes hot/cold FFN model. Requires --enable-attn-offloading '
+                        '(the DIMM). Default: disabled')
+    parser.add_argument('--hermes-cold-activation', type=float, default=0.1,
+                        help='Hermes baseline: fraction of cold FFN neurons activated per token '
+                        '(streamed near-data on the DIMM). Only applies with --hermes-hot-ratio. '
+                        'Default: 0.1')
     parser.add_argument('--prioritize-prefill', action='store_true', default=False,
                         help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
@@ -749,6 +770,8 @@ def main():
                                        link_bw=link_bw, pnm_combine_comm=inst_cfg["pnm_combine_comm"],
                                        pnm_kv_seq_partition=inst_cfg["pnm_kv_seq_partition"],
                                        num_pnm_modules=inst_cfg["num_pnm_modules"],
+                                       hermes_hot_ratio=inst_cfg["hermes_hot_ratio"],
+                                       hermes_cold_activation=inst_cfg["hermes_cold_activation"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -825,6 +848,8 @@ def main():
                                            link_bw=link_bw, pnm_combine_comm=inst_cfg["pnm_combine_comm"],
                                            pnm_kv_seq_partition=inst_cfg["pnm_kv_seq_partition"],
                                            num_pnm_modules=inst_cfg["num_pnm_modules"],
+                                           hermes_hot_ratio=inst_cfg["hermes_hot_ratio"],
+                                           hermes_cold_activation=inst_cfg["hermes_cold_activation"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -870,6 +895,8 @@ def main():
                                    link_bw=link_bw, pnm_combine_comm=inst_cfg["pnm_combine_comm"],
                                    pnm_kv_seq_partition=inst_cfg["pnm_kv_seq_partition"],
                                    num_pnm_modules=inst_cfg["num_pnm_modules"],
+                                   hermes_hot_ratio=inst_cfg["hermes_hot_ratio"],
+                                   hermes_cold_activation=inst_cfg["hermes_cold_activation"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

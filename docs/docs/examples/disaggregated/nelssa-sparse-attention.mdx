@@ -212,6 +212,8 @@ tier, backs off instead. Without offloading, the budget stays the ordinary
 | `--pnm-combine-comm` / `--no-pnm-combine-comm` | Model the decode-attention combine transfer (query down + partial results up over the PNM interconnect). Default on with offloading. |
 | `--pnm-kv-seq-partition` / `--no-pnm-kv-seq-partition` | Multi-module: partition each request's KV sequence across all PNM units (a single request uses every module). Default off. |
 | `--pnm-modules` | Number of PNM modules; scales the combine interconnect bandwidth (per-module links). Default `1`. |
+| `--hermes-hot-ratio` | Hermes baseline: fraction of FFN neurons kept hot on GPU HBM; the rest are offloaded to the DIMM/PNM and streamed near-data. Unset → dense FFN on GPU. Requires `--enable-attn-offloading`. |
+| `--hermes-cold-activation` | Fraction of the cold FFN neurons activated per token (contextual sparsity). Default `0.1`. Only active with `--hermes-hot-ratio`. |
 
 ### GPU-local KV split (recent + sink window)
 
@@ -360,6 +362,15 @@ To swap in a real measured profile, follow
   6K-token request drops from 19.3 → 14.0 ms TPOT (8 → 64 units). Configs with
   `pim_channels ≤ kv_head` (the bundled HC-PNM / HB-PNM) are unaffected.
   `--pnm-modules` scales the combine interconnect for per-module links.
+- **Hermes hot/cold FFN (`--hermes-hot-ratio`).** NELSSA's Hermes baseline [6]
+  splits FFN neurons into a hot set kept on GPU HBM and a cold set offloaded to
+  the NDP-DIMM (the PNM). The GPU computes the hot fraction while the *activated*
+  cold neurons (`--hermes-cold-activation`, contextual sparsity) stream near-data
+  on the DIMM at its bandwidth; the two overlap, so the FFN latency is
+  `max(gpu_hot, dimm_cold)` and only the un-hidden DIMM residual is emitted as a
+  serial node. Because most FFN weight stays off the GPU, the GPU FFN cost drops
+  to the hot fraction — e.g. a full HC-PNM run at 30.8 ms/step drops to ~25.3 ms
+  at `--hermes-hot-ratio 0.2`. Requires `--enable-attn-offloading`.
 - **Index build is on the prefill critical path.** The RetrievalAttention
   index build is emitted as a per-layer compute node during prefill (raising
   TTFT), sized by the PNM compute engine. Because the Chakra converter

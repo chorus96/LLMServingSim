@@ -122,6 +122,8 @@ class TraceCtx:
     pnm_combine_comm: bool = True  # model the query-broadcast + partial-result combine transfer over the PNM link
     pnm_kv_seq_partition: bool = False  # NELSSA multi-module: partition each request's KV sequence across ALL PNM units (uncaps single-request parallelism beyond kv_head)
     num_pnm_modules: int = 1  # number of PNM modules; scales the combine interconnect (per-module links)
+    hermes_hot_ratio: float = None  # Hermes baseline: fraction of FFN neurons kept hot on GPU (None = disabled)
+    hermes_cold_activation: float = 0.1  # Hermes: fraction of cold FFN neurons activated per token (streamed near-data on the DIMM)
 
 
 @dataclass
@@ -846,7 +848,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      attention_local_window=0, attention_sink_tokens=0,
                      sparse_index_build=True, pim_on_cxl=False,
                      link_bw=0, pnm_combine_comm=True,
-                     pnm_kv_seq_partition=False, num_pnm_modules=1):
+                     pnm_kv_seq_partition=False, num_pnm_modules=1,
+                     hermes_hot_ratio=None, hermes_cold_activation=0.1):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -887,6 +890,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pim_on_cxl=pim_on_cxl,
         link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
         pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
+        hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
     )
 
 
@@ -950,8 +954,13 @@ def _layer_category(perf_db, layer_name):
 
 
 def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer_num=None,
-                comm_type='NONE', comm_size=0, input_loc='LOCAL', output_loc='LOCAL'):
-    """Emit a single trace layer: lookup latency, compute sizes, format, track power."""
+                comm_type='NONE', comm_size=0, input_loc='LOCAL', output_loc='LOCAL',
+                latency_scale=1.0):
+    """Emit a single trace layer: lookup latency, compute sizes, format, track power.
+
+    ``latency_scale`` multiplies the looked-up latency (e.g. Hermes computes
+    only the hot fraction of the FFN on the GPU).
+    """
     category = _layer_category(ctx.perf_db, layer_name)
     if category is None:
         raise KeyError(
@@ -971,6 +980,9 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
         )
     else:  # dense
         latency_ns = _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
+
+    if latency_scale != 1.0:
+        latency_ns = max(1, int(latency_ns * latency_scale))
 
     # Size calculation uses the same canonical layer names.
     if layer_name == 'attention':
@@ -1341,6 +1353,48 @@ def _emit_pre_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_tag='NON
                    lines, power_acc, batch_tag)
 
 
+def _emit_hermes_ffn(ctx, bctx, layer_num, lines, power_acc, batch_tag='NONE'):
+    """Emit the Hermes hot/cold FFN (NELSSA baseline [6], NDP-DIMM).
+
+    Hermes partitions FFN neurons into a hot set kept on GPU HBM and a cold set
+    offloaded to the NDP-DIMM (the PNM). The GPU computes the hot fraction; the
+    activated cold neurons are computed near-data on the DIMM, streaming their
+    weights at the DIMM bandwidth. The two overlap, so the FFN latency is
+    ``max(gpu_hot, dimm_cold)`` -- only the un-hidden DIMM residual (emitted as
+    a serial node) extends the step. Cold FFN weights live on the DIMM, so the
+    GPU FFN cost drops to the hot fraction.
+    """
+    hot = ctx.hermes_hot_ratio
+    # GPU hot FFN: the normal dense stack, scaled to the hot fraction.
+    gpu_hot_ns = 0
+    for layer_name in _sequence(ctx.perf_db, "mlp_dense"):
+        if layer_name in _TP_ALLREDUCE_AFTER:
+            comm_size, comm_type = _tp_comm(ctx, layer_name, bctx.total_len)
+            gpu_hot_ns += _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
+                                      comm_type=_with_dim(comm_type, ctx.tp_dim), comm_size=comm_size,
+                                      latency_scale=hot)
+        else:
+            gpu_hot_ns += _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
+                                      latency_scale=hot)
+    # DIMM cold FFN: stream the activated cold weights near-data on the PNM.
+    if ctx.pim_model is not None:
+        _, gu_wt, _ = calculate_sizes(ctx.model, "gate_up_proj", bctx.total_len, parallel=ctx.tp_size, fp=ctx.fp)
+        _, dn_wt, _ = calculate_sizes(ctx.model, "down_proj", bctx.total_len, parallel=ctx.tp_size, fp=ctx.fp)
+        ffn_wt = gu_wt + dn_wt
+        cold_frac = (1.0 - hot) * ctx.hermes_cold_activation
+        pnm_bw = ctx.pim_model.get_config()["mem_bw"]  # GB/s == bytes/ns
+        dimm_cold_ns = int(cold_frac * ffn_wt / pnm_bw) if pnm_bw > 0 else 0
+        residual = max(0, dimm_cold_ns - int(gpu_hot_ns))
+        if residual > 0:
+            lines.append(formatter("cold_ffn", str(residual),
+                'LOCAL', str(int(cold_frac * ffn_wt)),
+                get_device(ctx.placement, layer_num, "down_proj", "weights"), '0',
+                'LOCAL', '0', 'NONE', '0', batch_tag))
+            if power_acc is not None:
+                power_acc.pim_latencies_ns.append(residual)
+                power_acc.dram_weight_bytes += int(cold_frac * ffn_wt)
+
+
 def _emit_post_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_id_str, batch_tag='NONE'):
     # Attention post-processing common to dense and MoE.
     _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, "post_attn"),
@@ -1353,6 +1407,9 @@ def _emit_post_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_id_str,
                 _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag)
             else:
                 _emit_sequence(ctx, bctx, layer_num, [layer_name], lines, power_acc, batch_tag)
+    elif ctx.hermes_hot_ratio is not None:
+        # Hermes baseline: hot FFN on GPU + cold FFN near-data on the DIMM.
+        _emit_hermes_ffn(ctx, bctx, layer_num, lines, power_acc, batch_tag)
     else:
         _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, "mlp_dense"),
                        lines, power_acc, batch_tag)
@@ -1460,7 +1517,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       attention_local_window=0, attention_sink_tokens=0,
                       sparse_index_build=True, pim_on_cxl=False,
                       link_bw=0, pnm_combine_comm=True,
-                      pnm_kv_seq_partition=False, num_pnm_modules=1):
+                      pnm_kv_seq_partition=False, num_pnm_modules=1,
+                      hermes_hot_ratio=None, hermes_cold_activation=0.1):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1473,7 +1531,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            attention_sink_tokens=attention_sink_tokens,
                            sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl,
                            link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
-                           pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules)
+                           pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
+                           hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1525,7 +1584,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   attention_local_window=0, attention_sink_tokens=0,
                                   sparse_index_build=True, pim_on_cxl=False,
                       link_bw=0, pnm_combine_comm=True,
-                      pnm_kv_seq_partition=False, num_pnm_modules=1):
+                      pnm_kv_seq_partition=False, num_pnm_modules=1,
+                      hermes_hot_ratio=None, hermes_cold_activation=0.1):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1538,7 +1598,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            attention_sink_tokens=attention_sink_tokens,
                            sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl,
                            link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
-                           pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules)
+                           pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
+                           hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1638,7 +1699,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    attention_local_window=0, attention_sink_tokens=0,
                    sparse_index_build=True, pim_on_cxl=False,
                    link_bw=0, pnm_combine_comm=True,
-                   pnm_kv_seq_partition=False, num_pnm_modules=1):
+                   pnm_kv_seq_partition=False, num_pnm_modules=1,
+                   hermes_hot_ratio=None, hermes_cold_activation=0.1):
 
     model = batch.model
     config = get_config(model)
@@ -1696,7 +1758,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         attention_sink_tokens=attention_sink_tokens,
                         sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl,
                         link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
-                        pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules)
+                        pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
+                        hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:

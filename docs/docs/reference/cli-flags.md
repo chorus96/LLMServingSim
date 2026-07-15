@@ -66,6 +66,8 @@ matching runtime knobs per `instances[i]`; see
 | `--pnm-combine-comm` / `--no-pnm-combine-comm` | on | Model the decode-attention combine transfer: query sent down to the PNM + partial results read back over the interconnect (`link_bw`). Requires `--enable-attn-offloading` |
 | `--pnm-kv-seq-partition` / `--no-pnm-kv-seq-partition` | off | NELSSA multi-module: partition each decode request's KV sequence across all PNM units so a single request uses every module (uncaps single-request parallelism beyond `kv_head`). Requires `--enable-attn-offloading` |
 | `--pnm-modules` | `1` | Number of PNM modules; scales the combine interconnect bandwidth (per-module links) |
+| `--hermes-hot-ratio` | `None` | Hermes baseline: fraction of FFN neurons kept hot on GPU HBM. The GPU computes the hot fraction; activated cold neurons stream near-data on the DIMM/PNM, overlapping the GPU FFN so only the un-hidden DIMM residual extends the step. Requires `--enable-attn-offloading` |
+| `--hermes-cold-activation` | `0.1` | Hermes: fraction of the cold FFN neurons activated per token (contextual sparsity) streamed near-data on the DIMM. Only applies when `--hermes-hot-ratio` is set |
 
 ## Dataset and output
 
