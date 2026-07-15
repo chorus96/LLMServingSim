@@ -218,6 +218,10 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "attention_local_window": attention_local_window,
             "attention_sink_tokens": attention_sink_tokens,
             "sparse_index_build": instance.get("sparse_index_build", args.sparse_index_build),
+            # Vector-index memory footprint applies only in sparse (RetrievalAttention) mode.
+            "sparse_index_footprint_ratio": (
+                instance.get("sparse_index_footprint_ratio", args.sparse_index_footprint_ratio)
+                if sparse_attention_ratio is not None else 0.0),
         })
     return runtime_configs
 
@@ -309,6 +313,11 @@ def main():
                         help='NELSSA: model the RetrievalAttention vector-index build cost at '
                         'prefill (per layer, on the PNM module). Only applies when '
                         '--sparse-attention-ratio is set. Default: enabled')
+    parser.add_argument('--sparse-index-footprint-ratio', type=float, default=0.10,
+                        help='NELSSA: RetrievalAttention vector-index memory footprint as a '
+                        'fraction of the KV cache size (the index is stored on the PNM alongside '
+                        'the KV, reducing effective KV capacity). Only applies when '
+                        '--sparse-attention-ratio is set. 0 disables. Default: 0.10')
     parser.add_argument('--prioritize-prefill', action='store_true', default=False,
                         help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
@@ -516,6 +525,7 @@ def main():
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
             enable_attn_offloading=inst_cfg["enable_attn_offloading"],
             pim_on_cxl=pim_on_cxl,
+            sparse_index_ratio=inst_cfg["sparse_index_footprint_ratio"],
         ))
 
     # Controller for astra-sim process communication

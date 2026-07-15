@@ -14,7 +14,7 @@ class Device(Enum):
     CXL = 3
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', enable_attn_offloading=False, pim_on_cxl=False):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', enable_attn_offloading=False, pim_on_cxl=False, sparse_index_ratio=0.0):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -68,10 +68,16 @@ class MemoryModel():
         #     instead of double-counting) -- the PNM is the bottom tier.
         self.kv_on_cxl = bool(enable_attn_offloading and pim_on_cxl and self.cxl_mem > 0)
         self.kv_on_remote = bool(enable_attn_offloading and not pim_on_cxl and self.cpu_mem > 0)
+        # In NELSSA sparse mode the RetrievalAttention vector index is stored on
+        # the PNM alongside the KV cache. Both scale with tokens, so reserve a
+        # proportional slice of the PNM capacity for the index: the KV budget
+        # shrinks to capacity / (1 + index_ratio) (KV : index = 1 : ratio at any
+        # fill level, so they hit the capacity together).
+        idx_div = 1.0 + max(0.0, sparse_index_ratio)
         if self.kv_on_cxl:
-            self.npu_mem = self.weight + self.cxl_mem
+            self.npu_mem = self.weight + self.cxl_mem / idx_div
         elif self.kv_on_remote:
-            self.npu_mem = self.weight + self.cpu_mem
+            self.npu_mem = self.weight + self.cpu_mem / idx_div
         else:
             self.npu_mem = real_npu_mem
         self.npu_used = self.weight

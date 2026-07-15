@@ -208,6 +208,7 @@ tier, backs off instead. Without offloading, the budget stays the ordinary
 | `--attention-local-window` | Recent decode tokens kept in GPU HBM and attended on the GPU (overlapping PIM). Default `0` (all decode KV on PIM). |
 | `--attention-sink-tokens` | Leading attention-sink tokens kept in GPU HBM (added to the local window). Default `0`. |
 | `--sparse-index-build` / `--no-sparse-index-build` | Model the RetrievalAttention vector-index build at prefill. Default on (only active with a sparse ratio). |
+| `--sparse-index-footprint-ratio` | Vector-index memory as a fraction of the KV cache (stored on the PNM, reduces KV capacity). Default `0.10`; `0` disables. Sparse mode only. |
 
 ### GPU-local KV split (recent + sink window)
 
@@ -277,6 +278,13 @@ path** (raising TTFT), not on decode. It is negligible for short prompts
 (~10 ms of TTFT at a 20K-token prompt on Llama-3.1-8B) and grows toward
 seconds for multi-million-token prompts — an upfront cost amortized over
 the whole decode. Model: `serving/core/pim_model.py::get_index_build_latency`.
+
+The index also **occupies PNM memory** alongside the KV cache, reducing the
+effective KV capacity (`--sparse-index-footprint-ratio`, default `0.10` =
+the index is 10% of the KV size; `0` disables). Since both scale with
+tokens, the KV budget shrinks to `PNM_capacity / (1 + ratio)` — e.g. a 1 TB
+HC-PNM holds ~930 GB of KV plus its index. This lowers the OOM boundary
+accordingly (`serving/core/memory_model.py`). Applies only in sparse mode.
 
 ## What's interesting
 
