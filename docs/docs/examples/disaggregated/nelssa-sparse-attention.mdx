@@ -239,6 +239,45 @@ interconnect (`link_bw: 64`), matching the paper. (Without offloading, the
 KV budget stays the ordinary `npu_mem − weight`.)
 :::
 
+### Full design-space sweep (all strategies)
+
+`scripts/nelssa_strategy_sweep.py` runs **every** long-context KV strategy
+the simulator models — the PNM arms plus their host-offload / CPU baselines —
+across a range of prompt lengths, and lays out the trade-off the paper argues:
+*where each strategy wins and where it falls over.* The seven arms differ along
+four axes — **compute location** (GPU / PNM / CPU), **KV location** (GPU HBM /
+PNM / host DRAM), **selection** (full / sparse), and **KV transfer** (none /
+selected / all):
+
+```bash
+python scripts/nelssa_strategy_sweep.py \
+  --lengths 4096,16384 --num-requests 4 \
+  --out-csv outputs/strategy_sweep.csv --out-plot outputs/strategy_sweep.png
+```
+
+```text
+Mean TPOT per step (ms) -- lower is better;  X = OOM / capacity-bound
+arm                       4K       16K
+GPU-only               49.76     88.09
+NELSSA (HC-PNM)        52.54     86.74
+Hermes (HC-PNM)        59.81    104.77
+CXL-PNM (HB-PNM)       49.26     83.30
+FlexGen                61.33    104.63
+InfiniGen              51.18     89.57
+RetrievalAttn-CPU      62.16     96.88
+```
+
+Two trends make the design-space trade-off concrete. First, the **full-attention
+/ full-transfer** arms (Hermes, FlexGen) fall progressively behind NELSSA as
+context grows (relative decode throughput 0.88→0.83× and 0.86→0.83× from
+4K→16K) — their cost scales with the *whole* KV, while NELSSA's 2% selection
+does not. Second, the **capacity-bound** arms (GPU-only on 96 GB HBM, CXL-PNM on
+128 GB) are fastest at short context but OOM (`X`) at extreme lengths where the
+HC-PNM's 1 TB + sparsity keeps running — the paper's Fig. 5 'X' markers. Each
+arm is driven by its own config + flags (they are mutually exclusive KV
+strategies); throughput is normalised to NELSSA. Pass `--only` to restrict the
+sweep to a subset of arms.
+
 ### CXL-attached PNM
 
 By default the PNM attaches to the node's `cpu_mem` (remote) tier and its
