@@ -203,6 +203,13 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
                 raise ValueError(
                     f"Instance {instance_id} hermes_hot_ratio must be in (0, 1], got {hermes_hot_ratio}")
 
+        flexgen_host_offload = instance.get("flexgen_host_offload", args.flexgen_host_offload)
+        if flexgen_host_offload and enable_attn_offloading:
+            raise RuntimeError(
+                f"Instance {instance_id} enables both flexgen_host_offload and attention "
+                f"offloading; they are competing KV strategies (FlexGen streams the full KV to "
+                f"the GPU, the PNM computes near-memory) -- pick one")
+
         runtime_configs.append({
             "max_num_seqs": _runtime_limit(instance.get("max_num_seqs", args.max_num_seqs)),
             "max_num_batched_tokens": _runtime_limit(
@@ -237,6 +244,7 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "num_pnm_modules": instance.get("num_pnm_modules", args.pnm_modules),
             "hermes_hot_ratio": hermes_hot_ratio,
             "hermes_cold_activation": instance.get("hermes_cold_activation", args.hermes_cold_activation),
+            "flexgen_host_offload": flexgen_host_offload,
         })
     return runtime_configs
 
@@ -356,6 +364,12 @@ def main():
                         help='Hermes baseline: fraction of cold FFN neurons activated per token '
                         '(streamed near-data on the DIMM). Only applies with --hermes-hot-ratio. '
                         'Default: 0.1')
+    parser.add_argument('--flexgen-host-offload', action='store_true', default=False,
+                        help='FlexGen baseline: keep the KV cache in host DRAM and compute '
+                        'attention on the GPU, streaming the attended KV over the interconnect '
+                        '(link_bw) every step. Transfer-bound (no near-memory compute, no '
+                        'sparsity) -- the host-offload contrast to the PNM path. Mutually '
+                        'exclusive with --enable-attn-offloading. Default: disabled')
     parser.add_argument('--prioritize-prefill', action='store_true', default=False,
                         help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
@@ -565,6 +579,7 @@ def main():
             enable_attn_offloading=inst_cfg["enable_attn_offloading"],
             pim_on_cxl=pim_on_cxl,
             sparse_index_ratio=inst_cfg["sparse_index_footprint_ratio"],
+            flexgen_host_offload=inst_cfg["flexgen_host_offload"],
         ))
 
     # Controller for astra-sim process communication
@@ -772,6 +787,7 @@ def main():
                                        num_pnm_modules=inst_cfg["num_pnm_modules"],
                                        hermes_hot_ratio=inst_cfg["hermes_hot_ratio"],
                                        hermes_cold_activation=inst_cfg["hermes_cold_activation"],
+                                       flexgen_host_offload=inst_cfg["flexgen_host_offload"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -850,6 +866,7 @@ def main():
                                            num_pnm_modules=inst_cfg["num_pnm_modules"],
                                            hermes_hot_ratio=inst_cfg["hermes_hot_ratio"],
                                            hermes_cold_activation=inst_cfg["hermes_cold_activation"],
+                                           flexgen_host_offload=inst_cfg["flexgen_host_offload"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -897,6 +914,7 @@ def main():
                                    num_pnm_modules=inst_cfg["num_pnm_modules"],
                                    hermes_hot_ratio=inst_cfg["hermes_hot_ratio"],
                                    hermes_cold_activation=inst_cfg["hermes_cold_activation"],
+                                   flexgen_host_offload=inst_cfg["flexgen_host_offload"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

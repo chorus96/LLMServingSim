@@ -115,6 +115,30 @@ caps sequence length — long-context runs OOM (the paper's Fig. 5 'X'
 markers), which is exactly where NELSSA's 1 TB HC-PNM + sparsity keeps
 running.
 
+### FlexGen host-offload baseline
+
+A fourth arm is the **host-offload** style (FlexGen): the KV cache sits in
+host DRAM and attention is computed on the GPU, so every decode step streams
+the full KV back over the interconnect. It scales capacity like the HC-PNM
+(host DRAM is large) but pays the full transfer cost each step with **no
+near-memory compute** — the transfer-bound behaviour NELSSA's PNM avoids.
+Its config, `configs/cluster/single_node_flexgen_baseline_instance.json`,
+sets `flexgen_host_offload` (no `pim_config`):
+
+```bash
+python -m serving \
+  --cluster-config 'configs/cluster/single_node_flexgen_baseline_instance.json' \
+  --dtype bfloat16 --flexgen-host-offload \
+  --dataset 'workloads/example_trace.jsonl' \
+  --output 'outputs/flexgen.csv' --log-level WARNING
+```
+
+On a 2×4K-token batch the KV streaming dominates: a no-offload GPU run at
+17.2 ms/step becomes ~30.7 ms under FlexGen (each decode layer streams
+~32 MB over the 64 GB/s link ≈ 0.47 ms), versus the PNM path which only
+moves the query + partial results. This is the motivation for computing
+attention near the KV rather than shipping the KV to the compute.
+
 ### Sweeping sequence lengths (Fig. 5)
 
 `scripts/nelssa_fig5_sweep.py` automates the three-arm comparison across a
@@ -214,6 +238,7 @@ tier, backs off instead. Without offloading, the budget stays the ordinary
 | `--pnm-modules` | Number of PNM modules; scales the combine interconnect bandwidth (per-module links). Default `1`. |
 | `--hermes-hot-ratio` | Hermes baseline: fraction of FFN neurons kept hot on GPU HBM; the rest are offloaded to the DIMM/PNM and streamed near-data. Unset → dense FFN on GPU. Requires `--enable-attn-offloading`. |
 | `--hermes-cold-activation` | Fraction of the cold FFN neurons activated per token (contextual sparsity). Default `0.1`. Only active with `--hermes-hot-ratio`. |
+| `--flexgen-host-offload` | FlexGen baseline: KV cache in host DRAM, attention computed on the GPU, full KV streamed over `link_bw` each step (transfer-bound). Mutually exclusive with `--enable-attn-offloading`. Default off. |
 
 ### GPU-local KV split (recent + sink window)
 
@@ -371,6 +396,19 @@ To swap in a real measured profile, follow
   serial node. Because most FFN weight stays off the GPU, the GPU FFN cost drops
   to the hot fraction — e.g. a full HC-PNM run at 30.8 ms/step drops to ~25.3 ms
   at `--hermes-hot-ratio 0.2`. Requires `--enable-attn-offloading`.
+- **FlexGen host offload (`--flexgen-host-offload`).** NELSSA's FlexGen baseline
+  keeps the KV cache in host DRAM and computes attention on the GPU, so every
+  decode step it must stream the attended KV history back over the interconnect
+  (`link_bw`, e.g. PCIe). Unlike the PNM path there is no near-memory compute and
+  no sparsity — the *full* KV cache moves each step, which is the transfer-bound
+  behaviour that motivates near-memory attention. FlexGen double-buffers the KV
+  load against GPU compute, so only the un-hidden residual (`max(0, kv_load −
+  attn_gpu)`) extends the step (a serial `kv_load` node, mirroring the PNM/Hermes
+  residual convention). KV capacity is sourced from host DRAM like the remote PNM,
+  so long context fits — but the transfer cost dominates: on a 2×4K-token batch a
+  no-offload GPU run at 17.2 ms/step becomes ~30.7 ms under FlexGen (each decode
+  layer streams ~32 MB over a 64 GB/s link ≈ 0.47 ms). Mutually exclusive with
+  `--enable-attn-offloading`.
 - **Index build is on the prefill critical path.** The RetrievalAttention
   index build is emitted as a per-layer compute node during prefill (raising
   TTFT), sized by the PNM compute engine. Because the Chakra converter

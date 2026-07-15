@@ -124,6 +124,7 @@ class TraceCtx:
     num_pnm_modules: int = 1  # number of PNM modules; scales the combine interconnect (per-module links)
     hermes_hot_ratio: float = None  # Hermes baseline: fraction of FFN neurons kept hot on GPU (None = disabled)
     hermes_cold_activation: float = 0.1  # Hermes: fraction of cold FFN neurons activated per token (streamed near-data on the DIMM)
+    flexgen_host_offload: bool = False  # FlexGen baseline: KV cache on host DRAM, computed on GPU, streamed over the interconnect every decode step (transfer-bound, no near-memory compute)
 
 
 @dataclass
@@ -849,7 +850,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      sparse_index_build=True, pim_on_cxl=False,
                      link_bw=0, pnm_combine_comm=True,
                      pnm_kv_seq_partition=False, num_pnm_modules=1,
-                     hermes_hot_ratio=None, hermes_cold_activation=0.1):
+                     hermes_hot_ratio=None, hermes_cold_activation=0.1,
+                     flexgen_host_offload=False):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -891,6 +893,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
         pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
         hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
+        flexgen_host_offload=flexgen_host_offload,
     )
 
 
@@ -1174,10 +1177,50 @@ def _emit_pim_index_build(ctx, bctx, lines, power_acc, layer_num, batch_tag='NON
 
 
 def _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
-    """Emit NPU attention (unified prefill+decode lookup)."""
+    """Emit NPU attention (unified prefill+decode lookup). Returns the GPU
+    attention latency (ns) so callers can overlap a KV-load transfer against it
+    (FlexGen host offload)."""
     if bctx.prefill_chunk == 0 and bctx.n_decode == 0:
+        return 0
+    return _emit_layer(ctx, bctx, "attention", lines, power_acc, batch_tag, layer_num)
+
+
+def _emit_flexgen_kv_load(ctx, bctx, lines, power_acc, layer_num, attn_gpu_ns, batch_tag='NONE'):
+    """Emit the FlexGen host-offload KV streaming cost (NELSSA baseline).
+
+    FlexGen keeps the KV cache in host DRAM and computes attention on the GPU,
+    so every step it must stream the attended KV history back over the
+    interconnect (``link_bw``, e.g. PCIe). Unlike the PNM path there is no
+    near-memory compute and no sparsity -- the full KV cache moves each step,
+    which is the transfer-bound behaviour that motivates near-memory attention.
+
+    FlexGen double-buffers the KV load against GPU compute, so the load of one
+    layer overlaps the attention compute of the previous; only the un-hidden
+    residual (``max(0, kv_load - attn_gpu)``) extends the step. Modeled as a
+    serial ``kv_load`` node after the GPU attention, mirroring the PNM/Hermes
+    residual convention. KV bytes are attributed to the interconnect.
+    """
+    if ctx.link_bw <= 0:
         return
-    _emit_layer(ctx, bctx, "attention", lines, power_acc, batch_tag, layer_num)
+    # KV history attended this step: prefill reqs re-read their prior chunks,
+    # decode reqs read their full history. Per-GPU KV shard (kv heads / TP).
+    streamed_tokens = bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean
+    if streamed_tokens <= 0:
+        return
+    kv_heads_local = max(1, ctx.kv_head // max(1, ctx.tp_size))
+    per_tok_kv = 2 * kv_heads_local * ctx.head_dim * ctx.fp  # K + V per token
+    kv_bytes = streamed_tokens * per_tok_kv
+    kv_load_ns = int(kv_bytes / ctx.link_bw)  # link_bw GB/s == bytes/ns
+    residual = max(0, kv_load_ns - int(attn_gpu_ns))
+    if residual <= 0:
+        return
+    lines.append(formatter("kv_load", str(residual),
+        'LOCAL', str(kv_bytes),
+        get_device(ctx.placement, layer_num, "attention", "weights"), '0',
+        'LOCAL', '0', 'NONE', '0', batch_tag))
+    if power_acc is not None:
+        power_acc.npu_latencies_ns.append(residual)
+        power_acc.link_data_bytes += kv_bytes
 
 
 def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag='NONE'):
@@ -1325,7 +1368,13 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
                 # NELSSA: build the RetrievalAttention index for prefilled KV.
                 if ctx.sparse_attention_ratio is not None and ctx.sparse_index_build:
                     _emit_pim_index_build(ctx, bctx, lines, power_acc, layer_num, batch_tag)
-            _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
+            attn_gpu_ns = _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
+            # FlexGen host offload: KV lives in host DRAM and streams over the
+            # interconnect each step; the un-hidden transfer residual extends the
+            # step (transfer-bound, no near-memory compute).
+            if ctx.flexgen_host_offload:
+                _emit_flexgen_kv_load(ctx, bctx, lines, power_acc, layer_num,
+                                      attn_gpu_ns or 0, batch_tag)
             continue
         if layer_name == "rotary_emb" and "TPU" in ctx.hardware:
             continue
@@ -1518,7 +1567,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       sparse_index_build=True, pim_on_cxl=False,
                       link_bw=0, pnm_combine_comm=True,
                       pnm_kv_seq_partition=False, num_pnm_modules=1,
-                      hermes_hot_ratio=None, hermes_cold_activation=0.1):
+                      hermes_hot_ratio=None, hermes_cold_activation=0.1,
+                      flexgen_host_offload=False):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1532,7 +1582,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl,
                            link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
                            pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
-                           hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation)
+                           hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
+                           flexgen_host_offload=flexgen_host_offload)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1585,7 +1636,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   sparse_index_build=True, pim_on_cxl=False,
                       link_bw=0, pnm_combine_comm=True,
                       pnm_kv_seq_partition=False, num_pnm_modules=1,
-                      hermes_hot_ratio=None, hermes_cold_activation=0.1):
+                      hermes_hot_ratio=None, hermes_cold_activation=0.1,
+                      flexgen_host_offload=False):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1599,7 +1651,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl,
                            link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
                            pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
-                           hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation)
+                           hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
+                           flexgen_host_offload=flexgen_host_offload)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1700,7 +1753,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    sparse_index_build=True, pim_on_cxl=False,
                    link_bw=0, pnm_combine_comm=True,
                    pnm_kv_seq_partition=False, num_pnm_modules=1,
-                   hermes_hot_ratio=None, hermes_cold_activation=0.1):
+                   hermes_hot_ratio=None, hermes_cold_activation=0.1,
+                   flexgen_host_offload=False):
 
     model = batch.model
     config = get_config(model)
@@ -1759,7 +1813,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl,
                         link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
                         pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
-                        hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation)
+                        hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
+                        flexgen_host_offload=flexgen_host_offload)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:
