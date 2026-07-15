@@ -115,6 +115,37 @@ caps sequence length — long-context runs OOM (the paper's Fig. 5 'X'
 markers), which is exactly where NELSSA's 1 TB HC-PNM + sparsity keeps
 running.
 
+### Sweeping sequence lengths (Fig. 5)
+
+`scripts/nelssa_fig5_sweep.py` automates the three-arm comparison across a
+range of prompt lengths and prints **relative decode throughput**
+(normalised to Hermes, from Mean TPOT so it reflects the decode step) with
+`X` for OOM — the paper's Fig. 5 view:
+
+```bash
+python scripts/nelssa_fig5_sweep.py \
+  --lengths 3072,6144,12288 --num-requests 4 \
+  --out-csv outputs/fig5_sweep.csv --out-plot outputs/fig5_sweep.png
+```
+
+```text
+NELSSA Fig. 5 -- relative decode throughput (normalised to Hermes)
+arm                           3K        6K       12K
+Hermes (HC-PNM full)       1.00x     1.00x     1.00x
+NELSSA (HC-PNM sparse)     1.53x     1.83x     2.03x
+CXL-PNM (HB-PNM full)      1.92x     2.20x     2.29x
+```
+
+The advantage over Hermes **grows with sequence length** (NELSSA
+1.53→2.03×, HB-PNM 1.92→2.29× from 3K→12K) — the paper's key trend, since
+decode attention takes a larger share of the step as KV grows. Use a batch
+(`--num-requests`) and long-enough prompts so the decode attention — where
+the arms differ — dominates the step. A PNM capacity override
+must stay ≥ its DIMM size (256 GB for the DDR5 HC-PNM, 16 GB for the
+LPDDR5X HB-PNM) or PIM disables; OOM markers therefore appear at large
+lengths, so faithful multi-hundred-K/M-token sweeps are slow.
+
+
 :::note Modeling the capacity limit
 With attention offloading the KV cache lives on the PNM, so the PNM
 device's capacity — not the GPU's — bounds the KV budget: it is sourced
