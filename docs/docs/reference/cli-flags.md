@@ -64,6 +64,8 @@ matching runtime knobs per `instances[i]`; see
 | `--sparse-index-build` / `--no-sparse-index-build` | on | Model the RetrievalAttention vector-index build cost at prefill (per layer, on the PNM module). Only applies when `--sparse-attention-ratio` is set |
 | `--sparse-index-footprint-ratio` | `0.10` | RetrievalAttention vector-index memory footprint as a fraction of the KV cache (stored on the PNM, reduces effective KV capacity). `0` disables. Sparse mode only |
 | `--pnm-combine-comm` / `--no-pnm-combine-comm` | on | Model the decode-attention combine transfer: query sent down to the PNM + partial results read back over the interconnect (`link_bw`). Requires `--enable-attn-offloading` |
+| `--pnm-kv-seq-partition` / `--no-pnm-kv-seq-partition` | off | NELSSA multi-module: partition each decode request's KV sequence across all PNM units so a single request uses every module (uncaps single-request parallelism beyond `kv_head`). Requires `--enable-attn-offloading` |
+| `--pnm-modules` | `1` | Number of PNM modules; scales the combine interconnect bandwidth (per-module links) |
 
 ## Dataset and output
 

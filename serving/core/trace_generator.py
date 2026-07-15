@@ -120,6 +120,8 @@ class TraceCtx:
     pim_on_cxl: bool = False  # PNM is CXL-attached: PIM blocks target CXL:{...} instead of REMOTE:{...}
     link_bw: float = 0  # GPU<->PNM interconnect bandwidth (GB/s) for the decode-attention combine transfer
     pnm_combine_comm: bool = True  # model the query-broadcast + partial-result combine transfer over the PNM link
+    pnm_kv_seq_partition: bool = False  # NELSSA multi-module: partition each request's KV sequence across ALL PNM units (uncaps single-request parallelism beyond kv_head)
+    num_pnm_modules: int = 1  # number of PNM modules; scales the combine interconnect (per-module links)
 
 
 @dataclass
@@ -843,7 +845,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
                      attention_local_window=0, attention_sink_tokens=0,
                      sparse_index_build=True, pim_on_cxl=False,
-                     link_bw=0, pnm_combine_comm=True):
+                     link_bw=0, pnm_combine_comm=True,
+                     pnm_kv_seq_partition=False, num_pnm_modules=1):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -883,6 +886,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         sparse_index_build=sparse_index_build,
         pim_on_cxl=pim_on_cxl,
         link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
+        pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
     )
 
 
@@ -913,7 +917,11 @@ def _build_batch_ctx(batch, ctx):
     decode_lens = None
     channel_split = 0
     if ctx.enable_attn_offloading and ctx.pim_model is not None:
-        channel_split = min(ctx.pim_channels, ctx.kv_head)
+        # NELSSA multi-module: partitioning each request's KV sequence across
+        # modules lets a single request use ALL PNM units. Without it, splitting
+        # only by KV head caps single-request parallelism at kv_head, leaving
+        # extra units (pim_channels > kv_head) idle.
+        channel_split = ctx.pim_channels if ctx.pnm_kv_seq_partition else min(ctx.pim_channels, ctx.kv_head)
         _, decode_lens = _attn_load_balancer(batch.requests, ctx.tp_size, ctx.pim_channels, channel_split)
         n_decode = 0
         kv_decode_mean = 0
@@ -1104,7 +1112,10 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
         qo_bytes = 2 * n_decode_total * per_tok            # query down + result up
         lse_bytes = 2 * n_decode_total * ctx.n_head * ctx.fp  # softmax max+sum per head
         link_bytes = qo_bytes + lse_bytes
-        link_ns = int(link_bytes / ctx.link_bw)  # link_bw GB/s == bytes/ns
+        # Each PNM module has its own interconnect link, so M modules give M x
+        # the aggregate combine bandwidth.
+        eff_link_bw = ctx.link_bw * max(1, ctx.num_pnm_modules)
+        link_ns = int(link_bytes / eff_link_bw)  # link_bw GB/s == bytes/ns
         if link_ns > 0:
             lines.append(formatter("combine", str(link_ns),
                 'LOCAL', str(n_decode_total * per_tok),
@@ -1448,7 +1459,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
                       attention_local_window=0, attention_sink_tokens=0,
                       sparse_index_build=True, pim_on_cxl=False,
-                      link_bw=0, pnm_combine_comm=True):
+                      link_bw=0, pnm_combine_comm=True,
+                      pnm_kv_seq_partition=False, num_pnm_modules=1):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1460,7 +1472,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            attention_local_window=attention_local_window,
                            attention_sink_tokens=attention_sink_tokens,
                            sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl,
-                           link_bw=link_bw, pnm_combine_comm=pnm_combine_comm)
+                           link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
+                           pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1511,7 +1524,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
                                   attention_local_window=0, attention_sink_tokens=0,
                                   sparse_index_build=True, pim_on_cxl=False,
-                      link_bw=0, pnm_combine_comm=True):
+                      link_bw=0, pnm_combine_comm=True,
+                      pnm_kv_seq_partition=False, num_pnm_modules=1):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1523,7 +1537,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            attention_local_window=attention_local_window,
                            attention_sink_tokens=attention_sink_tokens,
                            sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl,
-                           link_bw=link_bw, pnm_combine_comm=pnm_combine_comm)
+                           link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
+                           pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1622,7 +1637,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    sparse_attention_ratio=None, sparse_vector_search_nprobe=32,
                    attention_local_window=0, attention_sink_tokens=0,
                    sparse_index_build=True, pim_on_cxl=False,
-                   link_bw=0, pnm_combine_comm=True):
+                   link_bw=0, pnm_combine_comm=True,
+                   pnm_kv_seq_partition=False, num_pnm_modules=1):
 
     model = batch.model
     config = get_config(model)
@@ -1679,7 +1695,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         attention_local_window=attention_local_window,
                         attention_sink_tokens=attention_sink_tokens,
                         sparse_index_build=sparse_index_build, pim_on_cxl=pim_on_cxl,
-                        link_bw=link_bw, pnm_combine_comm=pnm_combine_comm)
+                        link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
+                        pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:

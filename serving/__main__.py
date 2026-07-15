@@ -223,6 +223,8 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
                 instance.get("sparse_index_footprint_ratio", args.sparse_index_footprint_ratio)
                 if sparse_attention_ratio is not None else 0.0),
             "pnm_combine_comm": instance.get("pnm_combine_comm", args.pnm_combine_comm),
+            "pnm_kv_seq_partition": instance.get("pnm_kv_seq_partition", args.pnm_kv_seq_partition),
+            "num_pnm_modules": instance.get("num_pnm_modules", args.pnm_modules),
         })
     return runtime_configs
 
@@ -324,6 +326,15 @@ def main():
                         'each query down to the PNM and reads the partial results back over the '
                         'interconnect (link_bw), then merges them. Only applies with '
                         '--enable-attn-offloading. Default: enabled')
+    parser.add_argument('--pnm-kv-seq-partition', action=argparse.BooleanOptionalAction, default=False,
+                        help='NELSSA multi-module: partition each decode request\'s KV sequence '
+                        'across ALL PNM units so a single request uses every module. Without it, '
+                        'splitting only by KV head caps single-request parallelism at kv_head, '
+                        'leaving extra units (pim_channels > kv_head) idle. Requires '
+                        '--enable-attn-offloading. Default: disabled')
+    parser.add_argument('--pnm-modules', type=int, default=1,
+                        help='NELSSA: number of PNM modules. Scales the combine interconnect '
+                        'bandwidth (each module has its own link). Default: 1')
     parser.add_argument('--prioritize-prefill', action='store_true', default=False,
                         help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
@@ -736,6 +747,8 @@ def main():
                                        sparse_index_build=inst_cfg["sparse_index_build"],
                                        pim_on_cxl=pim_on_cxl,
                                        link_bw=link_bw, pnm_combine_comm=inst_cfg["pnm_combine_comm"],
+                                       pnm_kv_seq_partition=inst_cfg["pnm_kv_seq_partition"],
+                                       num_pnm_modules=inst_cfg["num_pnm_modules"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -810,6 +823,8 @@ def main():
                                            sparse_index_build=inst_cfg["sparse_index_build"],
                                            pim_on_cxl=pim_on_cxl,
                                            link_bw=link_bw, pnm_combine_comm=inst_cfg["pnm_combine_comm"],
+                                           pnm_kv_seq_partition=inst_cfg["pnm_kv_seq_partition"],
+                                           num_pnm_modules=inst_cfg["num_pnm_modules"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -853,6 +868,8 @@ def main():
                                    sparse_index_build=inst_cfg["sparse_index_build"],
                                    pim_on_cxl=pim_on_cxl,
                                    link_bw=link_bw, pnm_combine_comm=inst_cfg["pnm_combine_comm"],
+                                   pnm_kv_seq_partition=inst_cfg["pnm_kv_seq_partition"],
+                                   num_pnm_modules=inst_cfg["num_pnm_modules"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

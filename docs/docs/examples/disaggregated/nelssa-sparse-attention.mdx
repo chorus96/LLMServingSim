@@ -210,6 +210,8 @@ tier, backs off instead. Without offloading, the budget stays the ordinary
 | `--sparse-index-build` / `--no-sparse-index-build` | Model the RetrievalAttention vector-index build at prefill. Default on (only active with a sparse ratio). |
 | `--sparse-index-footprint-ratio` | Vector-index memory as a fraction of the KV cache (stored on the PNM, reduces KV capacity). Default `0.10`; `0` disables. Sparse mode only. |
 | `--pnm-combine-comm` / `--no-pnm-combine-comm` | Model the decode-attention combine transfer (query down + partial results up over the PNM interconnect). Default on with offloading. |
+| `--pnm-kv-seq-partition` / `--no-pnm-kv-seq-partition` | Multi-module: partition each request's KV sequence across all PNM units (a single request uses every module). Default off. |
+| `--pnm-modules` | Number of PNM modules; scales the combine interconnect bandwidth (per-module links). Default `1`. |
 
 ### GPU-local KV split (recent + sink window)
 
@@ -349,6 +351,15 @@ To swap in a real measured profile, follow
   link, distinct from the PNM's internal bandwidth); the merge compute itself
   is negligible per the paper. Small at low concurrency, it grows with the
   decode batch — e.g. ~0.24 ms of TPOT on an 8-request Llama-3.1-8B batch.
+- **Multi-module KV partitioning (`--pnm-kv-seq-partition`).** NELSSA partitions
+  each request's KV *sequence* across the PNM modules, so a single long request
+  is served by every module. By default the simulator splits attention only by
+  KV head, capping single-request parallelism at `kv_head` and leaving extra
+  units (`pim_channels > kv_head`) idle. Enable this flag to partition by
+  sequence and use all units — e.g. on a 64-channel DDR4 PNM a single
+  6K-token request drops from 19.3 → 14.0 ms TPOT (8 → 64 units). Configs with
+  `pim_channels ≤ kv_head` (the bundled HC-PNM / HB-PNM) are unaffected.
+  `--pnm-modules` scales the combine interconnect for per-module links.
 - **Index build is on the prefill critical path.** The RetrievalAttention
   index build is emitted as a per-layer compute node during prefill (raising
   TTFT), sized by the PNM compute engine. Because the Chakra converter
