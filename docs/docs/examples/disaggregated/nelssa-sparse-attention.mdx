@@ -168,6 +168,32 @@ transfer surfaces again (~29.5 ms/step, ~30 MB/layer over the link). This is
 why NELSSA computes *in* the PNM — even a smart, sparse prefetcher still pays
 the interconnect for whatever KV it selects.
 
+### RetrievalAttention-CPU baseline
+
+A sixth arm runs NELSSA's *exact* sparse attention — the same IVF token
+selection, 2% top-k, and vector-index build — but on **CPU cores** instead of
+the PNM. It keeps the KV in host DRAM and computes attention in place (so, like
+the PNM, only the query + result cross the link), but the CPU has no per-channel
+near-memory compute: decode requests share a small number of CPU streams
+(`--retrieval-cpu-parallel`, default serial). Its config,
+`configs/cluster/single_node_retrieval_cpu_instance.json`, sets
+`retrieval_cpu_sparse` on the offload path:
+
+```bash
+python -m serving \
+  --cluster-config 'configs/cluster/single_node_retrieval_cpu_instance.json' \
+  --dtype bfloat16 \
+  --dataset 'workloads/example_trace.jsonl' \
+  --output 'outputs/retrieval_cpu.csv' --log-level WARNING
+```
+
+On a 4×4K-token decode batch RetrievalAttention-CPU (serial) runs ~33.9 ms/step
+versus NELSSA's ~18.0 ms on the same sparse algorithm — the CPU serializes the
+decode attention that the HC-PNM's four channels compute in parallel. Raising
+`--retrieval-cpu-parallel` to 4 closes the gap (~18.9 ms), isolating the
+near-memory *parallelism* as the PNM's advantage: identical selection work, but
+the PNM attacks it with per-channel compute units the CPU lacks.
+
 ### Sweeping sequence lengths (Fig. 5)
 
 `scripts/nelssa_fig5_sweep.py` automates the three-arm comparison across a
@@ -270,6 +296,8 @@ tier, backs off instead. Without offloading, the budget stays the ordinary
 | `--flexgen-host-offload` | FlexGen baseline: KV cache in host DRAM, attention computed on the GPU, full KV streamed over `link_bw` each step (transfer-bound). Mutually exclusive with `--enable-attn-offloading`. Default off. |
 | `--infinigen-prefetch-ratio` | InfiniGen baseline: KV in host DRAM, speculatively prefetch only this fraction of KV to the GPU each step and attend over it (selected-KV transfer + speculation scan). Mutually exclusive with `--enable-attn-offloading` / `--flexgen-host-offload`. Default off. |
 | `--infinigen-speculation-ratio` | InfiniGen: speculation-scan cost as a fraction of the full-KV GPU attention (partial rank / head_dim). Default `0.25`. Only active with `--infinigen-prefetch-ratio`. |
+| `--retrieval-cpu-sparse` | RetrievalAttention-CPU baseline: run the same sparse attention (IVF selection + index build) as NELSSA but on CPU cores, without the PNM's per-channel parallelism. Requires `--enable-attn-offloading` + `--sparse-attention-ratio`. Default off. |
+| `--retrieval-cpu-parallel` | RetrievalAttention-CPU: parallel CPU compute streams for sparse attention (`1` = serial). Default `1`. Only active with `--retrieval-cpu-sparse`. |
 
 ### GPU-local KV split (recent + sink window)
 
@@ -451,6 +479,17 @@ To swap in a real measured profile, follow
   At a small ratio the transfer hides under compute (speculation-bound); raising
   it walks the step back toward FlexGen. Mutually exclusive with
   `--enable-attn-offloading` / `--flexgen-host-offload`.
+- **RetrievalAttention-CPU (`--retrieval-cpu-sparse`).** Reuses NELSSA's sparse
+  attention path (same `get_sparse_pim_latency` selection + vector search and the
+  same index build) but overrides the PNM channel count with the CPU's compute
+  parallelism (`--retrieval-cpu-parallel`, default 1) and computes each decode
+  request whole (no KV-head split). Decode requests are spread across those CPU
+  streams, so with the default serial setting the batch's sparse attention
+  serializes where the PNM would fan it out across its channels. The KV stays in
+  host DRAM and the compute is attributed to the CPU tier (`REMOTE`), so — like
+  the PNM — only the query + result cross the link; the modeled gap is purely the
+  lost near-memory parallelism. Requires `--enable-attn-offloading` +
+  `--sparse-attention-ratio`.
 - **Index build is on the prefill critical path.** The RetrievalAttention
   index build is emitted as a per-layer compute node during prefill (raising
   TTFT), sized by the PNM compute engine. Because the Chakra converter

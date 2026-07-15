@@ -229,6 +229,25 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
                     f"Instance {instance_id} infinigen_speculation_ratio must be non-negative, "
                     f"got {infinigen_speculation_ratio}")
 
+        retrieval_cpu_sparse = instance.get("retrieval_cpu_sparse", args.retrieval_cpu_sparse)
+        retrieval_cpu_parallel = instance.get(
+            "retrieval_cpu_parallel", args.retrieval_cpu_parallel)
+        if retrieval_cpu_sparse:
+            if not enable_attn_offloading:
+                raise RuntimeError(
+                    f"Instance {instance_id} sets retrieval_cpu_sparse without attention "
+                    f"offloading; the CPU-sparse baseline reuses the offload path "
+                    f"(--enable-attn-offloading)")
+            if sparse_attention_ratio is None:
+                raise RuntimeError(
+                    f"Instance {instance_id} sets retrieval_cpu_sparse without a "
+                    f"sparse_attention_ratio; RetrievalAttention-CPU runs dynamic sparse "
+                    f"attention (--sparse-attention-ratio)")
+            if retrieval_cpu_parallel < 1:
+                raise ValueError(
+                    f"Instance {instance_id} retrieval_cpu_parallel must be >= 1, "
+                    f"got {retrieval_cpu_parallel}")
+
         runtime_configs.append({
             "max_num_seqs": _runtime_limit(instance.get("max_num_seqs", args.max_num_seqs)),
             "max_num_batched_tokens": _runtime_limit(
@@ -266,6 +285,8 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "flexgen_host_offload": flexgen_host_offload,
             "infinigen_prefetch_ratio": infinigen_prefetch_ratio,
             "infinigen_speculation_ratio": infinigen_speculation_ratio,
+            "retrieval_cpu_sparse": retrieval_cpu_sparse,
+            "retrieval_cpu_parallel": retrieval_cpu_parallel,
         })
     return runtime_configs
 
@@ -403,6 +424,16 @@ def main():
                         help='InfiniGen: cost of the partial-attention speculation scan as a '
                         'fraction of the full-KV GPU attention (partial rank / head_dim). Only '
                         'applies with --infinigen-prefetch-ratio. Default: 0.25')
+    parser.add_argument('--retrieval-cpu-sparse', action='store_true', default=False,
+                        help='RetrievalAttention-CPU baseline: run the same dynamic sparse '
+                        'attention (IVF selection + index build) as NELSSA, but on CPU cores '
+                        'instead of the PNM. Loses the PNM per-channel near-memory parallelism, '
+                        'so decode attention throughput is CPU-bound. Requires '
+                        '--enable-attn-offloading and --sparse-attention-ratio. Default: disabled')
+    parser.add_argument('--retrieval-cpu-parallel', type=int, default=1,
+                        help='RetrievalAttention-CPU: number of parallel CPU compute streams for '
+                        'sparse attention (decode requests are distributed across them; 1 = '
+                        'serial). Only applies with --retrieval-cpu-sparse. Default: 1')
     parser.add_argument('--prioritize-prefill', action='store_true', default=False,
                         help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
@@ -824,6 +855,8 @@ def main():
                                        flexgen_host_offload=inst_cfg["flexgen_host_offload"],
                                        infinigen_prefetch_ratio=inst_cfg["infinigen_prefetch_ratio"],
                                        infinigen_speculation_ratio=inst_cfg["infinigen_speculation_ratio"],
+                                       retrieval_cpu_sparse=inst_cfg["retrieval_cpu_sparse"],
+                                       retrieval_cpu_parallel=inst_cfg["retrieval_cpu_parallel"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -905,6 +938,8 @@ def main():
                                            flexgen_host_offload=inst_cfg["flexgen_host_offload"],
                                            infinigen_prefetch_ratio=inst_cfg["infinigen_prefetch_ratio"],
                                            infinigen_speculation_ratio=inst_cfg["infinigen_speculation_ratio"],
+                                           retrieval_cpu_sparse=inst_cfg["retrieval_cpu_sparse"],
+                                           retrieval_cpu_parallel=inst_cfg["retrieval_cpu_parallel"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -955,6 +990,8 @@ def main():
                                    flexgen_host_offload=inst_cfg["flexgen_host_offload"],
                                    infinigen_prefetch_ratio=inst_cfg["infinigen_prefetch_ratio"],
                                    infinigen_speculation_ratio=inst_cfg["infinigen_speculation_ratio"],
+                                   retrieval_cpu_sparse=inst_cfg["retrieval_cpu_sparse"],
+                                   retrieval_cpu_parallel=inst_cfg["retrieval_cpu_parallel"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

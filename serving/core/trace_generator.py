@@ -127,6 +127,8 @@ class TraceCtx:
     flexgen_host_offload: bool = False  # FlexGen baseline: KV cache on host DRAM, computed on GPU, streamed over the interconnect every decode step (transfer-bound, no near-memory compute)
     infinigen_prefetch_ratio: float = None  # InfiniGen baseline: fraction of KV tokens speculatively prefetched to GPU per decode step (None = disabled). GPU compute, only the selected KV crosses the link.
     infinigen_speculation_ratio: float = 0.25  # InfiniGen: partial-attention speculation scan cost as a fraction of the full-KV GPU attention (partial rank / head_dim)
+    retrieval_cpu_sparse: bool = False  # RetrievalAttention-CPU baseline: run the same sparse selection on CPU cores instead of the PNM (no near-memory channel parallelism)
+    retrieval_cpu_parallel: int = 1  # RetrievalAttention-CPU: number of parallel CPU compute streams for sparse attention (decode requests distributed across them; 1 = serial)
 
 
 @dataclass
@@ -854,7 +856,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      pnm_kv_seq_partition=False, num_pnm_modules=1,
                      hermes_hot_ratio=None, hermes_cold_activation=0.1,
                      flexgen_host_offload=False,
-                     infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25):
+                     infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25,
+                     retrieval_cpu_sparse=False, retrieval_cpu_parallel=1):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -876,6 +879,12 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
     if enable_attn_offloading and pim_model is not None:
         pim_config = pim_model.get_config()
         pim_channels = int(pim_config["mem_size"] // pim_config["dimm_size"])
+        # RetrievalAttention-CPU: the sparse attention runs on CPU cores, not on
+        # the PNM's per-channel near-memory engines. Model that as a small number
+        # of parallel compute streams (default serial), overriding the PNM's
+        # channel count so decode requests share the limited CPU parallelism.
+        if retrieval_cpu_sparse:
+            pim_channels = max(1, int(retrieval_cpu_parallel))
 
     return TraceCtx(
         hardware=hardware, model=model, config=config, perf_db=perf_db,
@@ -899,6 +908,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         flexgen_host_offload=flexgen_host_offload,
         infinigen_prefetch_ratio=infinigen_prefetch_ratio,
         infinigen_speculation_ratio=infinigen_speculation_ratio,
+        retrieval_cpu_sparse=retrieval_cpu_sparse,
+        retrieval_cpu_parallel=retrieval_cpu_parallel,
     )
 
 
@@ -933,7 +944,13 @@ def _build_batch_ctx(batch, ctx):
         # modules lets a single request use ALL PNM units. Without it, splitting
         # only by KV head caps single-request parallelism at kv_head, leaving
         # extra units (pim_channels > kv_head) idle.
-        channel_split = ctx.pim_channels if ctx.pnm_kv_seq_partition else min(ctx.pim_channels, ctx.kv_head)
+        if ctx.retrieval_cpu_sparse:
+            # CPU cores process each decode request whole (no KV-head splitting);
+            # requests are spread across the CPU's parallel streams (pim_channels
+            # was overridden to retrieval_cpu_parallel).
+            channel_split = 1
+        else:
+            channel_split = ctx.pim_channels if ctx.pnm_kv_seq_partition else min(ctx.pim_channels, ctx.kv_head)
         _, decode_lens = _attn_load_balancer(batch.requests, ctx.tp_size, ctx.pim_channels, channel_split)
         n_decode = 0
         kv_decode_mean = 0
@@ -1650,7 +1667,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       pnm_kv_seq_partition=False, num_pnm_modules=1,
                       hermes_hot_ratio=None, hermes_cold_activation=0.1,
                       flexgen_host_offload=False,
-                      infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25):
+                      infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25,
+                      retrieval_cpu_sparse=False, retrieval_cpu_parallel=1):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1667,7 +1685,9 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
                            flexgen_host_offload=flexgen_host_offload,
                            infinigen_prefetch_ratio=infinigen_prefetch_ratio,
-                           infinigen_speculation_ratio=infinigen_speculation_ratio)
+                           infinigen_speculation_ratio=infinigen_speculation_ratio,
+                           retrieval_cpu_sparse=retrieval_cpu_sparse,
+                           retrieval_cpu_parallel=retrieval_cpu_parallel)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1722,7 +1742,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                       pnm_kv_seq_partition=False, num_pnm_modules=1,
                       hermes_hot_ratio=None, hermes_cold_activation=0.1,
                       flexgen_host_offload=False,
-                      infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25):
+                      infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25,
+                      retrieval_cpu_sparse=False, retrieval_cpu_parallel=1):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1739,7 +1760,9 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
                            flexgen_host_offload=flexgen_host_offload,
                            infinigen_prefetch_ratio=infinigen_prefetch_ratio,
-                           infinigen_speculation_ratio=infinigen_speculation_ratio)
+                           infinigen_speculation_ratio=infinigen_speculation_ratio,
+                           retrieval_cpu_sparse=retrieval_cpu_sparse,
+                           retrieval_cpu_parallel=retrieval_cpu_parallel)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1842,7 +1865,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    pnm_kv_seq_partition=False, num_pnm_modules=1,
                    hermes_hot_ratio=None, hermes_cold_activation=0.1,
                    flexgen_host_offload=False,
-                   infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25):
+                   infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25,
+                   retrieval_cpu_sparse=False, retrieval_cpu_parallel=1):
 
     model = batch.model
     config = get_config(model)
@@ -1904,7 +1928,9 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
                         flexgen_host_offload=flexgen_host_offload,
                         infinigen_prefetch_ratio=infinigen_prefetch_ratio,
-                        infinigen_speculation_ratio=infinigen_speculation_ratio)
+                        infinigen_speculation_ratio=infinigen_speculation_ratio,
+                        retrieval_cpu_sparse=retrieval_cpu_sparse,
+                        retrieval_cpu_parallel=retrieval_cpu_parallel)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:
