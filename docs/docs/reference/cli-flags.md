@@ -69,6 +69,8 @@ matching runtime knobs per `instances[i]`; see
 | `--hermes-hot-ratio` | `None` | Hermes baseline: fraction of FFN neurons kept hot on GPU HBM. The GPU computes the hot fraction; activated cold neurons stream near-data on the DIMM/PNM, overlapping the GPU FFN so only the un-hidden DIMM residual extends the step. Requires `--enable-attn-offloading` |
 | `--hermes-cold-activation` | `0.1` | Hermes: fraction of the cold FFN neurons activated per token (contextual sparsity) streamed near-data on the DIMM. Only applies when `--hermes-hot-ratio` is set |
 | `--flexgen-host-offload` | off | FlexGen baseline: keep the KV cache in host DRAM and compute attention on the GPU, streaming the attended KV over the interconnect (`link_bw`) every decode step. Transfer-bound (no near-memory compute, no sparsity) — the host-offload contrast to the PNM path. Mutually exclusive with `--enable-attn-offloading` |
+| `--infinigen-prefetch-ratio` | `None` | InfiniGen baseline: KV cache in host DRAM, but each decode step speculatively prefetches only this fraction of KV tokens (e.g. `0.02`) to the GPU and computes attention over them. Pays a speculation scan + a transfer of the *selected* KV over `link_bw` — the middle ground between FlexGen (transfer all) and the PNM (transfer none). Mutually exclusive with `--enable-attn-offloading` / `--flexgen-host-offload` |
+| `--infinigen-speculation-ratio` | `0.25` | InfiniGen: cost of the partial-attention speculation scan as a fraction of the full-KV GPU attention (partial rank / head_dim). Only applies with `--infinigen-prefetch-ratio` |
 
 ## Dataset and output
 

@@ -139,6 +139,35 @@ On a 2×4K-token batch the KV streaming dominates: a no-offload GPU run at
 moves the query + partial results. This is the motivation for computing
 attention near the KV rather than shipping the KV to the compute.
 
+### InfiniGen speculative-prefetch baseline
+
+A fifth arm is **InfiniGen**: also host-offload with GPU compute, but instead
+of streaming the whole KV it runs a cheap *speculation* scan (a partial-rank
+query-key pass over an on-GPU key sketch) to predict the critical KV entries,
+then prefetches only that fraction from host and attends over just those
+tokens. It is the middle ground between FlexGen (transfer everything) and the
+PNM (transfer nothing — compute in place): InfiniGen still ships the *selected*
+KV over the slow link. Its config,
+`configs/cluster/single_node_infinigen_baseline_instance.json`, sets
+`infinigen_prefetch_ratio` (no `pim_config`):
+
+```bash
+python -m serving \
+  --cluster-config 'configs/cluster/single_node_infinigen_baseline_instance.json' \
+  --dtype bfloat16 --infinigen-prefetch-ratio 0.02 \
+  --dataset 'workloads/example_trace.jsonl' \
+  --output 'outputs/infinigen.csv' --log-level WARNING
+```
+
+On the same 2×4K-token batch InfiniGen at 2% prefetch runs ~17.0 ms/step —
+recovering nearly all of FlexGen's transfer cost, because the selected KV
+(~0.7 MB/layer) transfers in ~10 µs and hides entirely under the speculation
+scan + selected-KV attention. Its overhead is thus the speculation, not the
+link. Raising the prefetch ratio walks it back toward FlexGen: at 90% the
+transfer surfaces again (~29.5 ms/step, ~30 MB/layer over the link). This is
+why NELSSA computes *in* the PNM — even a smart, sparse prefetcher still pays
+the interconnect for whatever KV it selects.
+
 ### Sweeping sequence lengths (Fig. 5)
 
 `scripts/nelssa_fig5_sweep.py` automates the three-arm comparison across a
@@ -239,6 +268,8 @@ tier, backs off instead. Without offloading, the budget stays the ordinary
 | `--hermes-hot-ratio` | Hermes baseline: fraction of FFN neurons kept hot on GPU HBM; the rest are offloaded to the DIMM/PNM and streamed near-data. Unset → dense FFN on GPU. Requires `--enable-attn-offloading`. |
 | `--hermes-cold-activation` | Fraction of the cold FFN neurons activated per token (contextual sparsity). Default `0.1`. Only active with `--hermes-hot-ratio`. |
 | `--flexgen-host-offload` | FlexGen baseline: KV cache in host DRAM, attention computed on the GPU, full KV streamed over `link_bw` each step (transfer-bound). Mutually exclusive with `--enable-attn-offloading`. Default off. |
+| `--infinigen-prefetch-ratio` | InfiniGen baseline: KV in host DRAM, speculatively prefetch only this fraction of KV to the GPU each step and attend over it (selected-KV transfer + speculation scan). Mutually exclusive with `--enable-attn-offloading` / `--flexgen-host-offload`. Default off. |
+| `--infinigen-speculation-ratio` | InfiniGen: speculation-scan cost as a fraction of the full-KV GPU attention (partial rank / head_dim). Default `0.25`. Only active with `--infinigen-prefetch-ratio`. |
 
 ### GPU-local KV split (recent + sink window)
 
@@ -409,6 +440,17 @@ To swap in a real measured profile, follow
   no-offload GPU run at 17.2 ms/step becomes ~30.7 ms under FlexGen (each decode
   layer streams ~32 MB over a 64 GB/s link ≈ 0.47 ms). Mutually exclusive with
   `--enable-attn-offloading`.
+- **InfiniGen speculative prefetch (`--infinigen-prefetch-ratio`).** Like FlexGen,
+  KV lives in host DRAM and attention runs on the GPU, but only a selected
+  fraction is prefetched each step. Per decode step the model emits: a
+  `kv_speculate` node (partial-rank scan, `--infinigen-speculation-ratio` × the
+  full-KV GPU attention, default 0.25), a GPU attention over the *selected* decode
+  KV (`kv_decode` thinned by the ratio; prefill stays full), and a `kv_prefetch`
+  transfer of the selected KV over `link_bw` — double-buffered, so only its
+  un-hidden residual (`max(0, kv_load − attn_sel − speculate)`) extends the step.
+  At a small ratio the transfer hides under compute (speculation-bound); raising
+  it walks the step back toward FlexGen. Mutually exclusive with
+  `--enable-attn-offloading` / `--flexgen-host-offload`.
 - **Index build is on the prefill critical path.** The RetrievalAttention
   index build is emitted as a per-layer compute node during prefill (raising
   TTFT), sized by the PNM compute engine. Because the Chakra converter

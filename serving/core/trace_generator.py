@@ -13,7 +13,7 @@ from .pim_model import PIMModel
 from .logger import get_logger
 from .run_paths import input_path
 import bisect
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 # ----------------------------------------------------------------------
 # Global in-memory cache for the profiler's per-category performance DB.
@@ -125,6 +125,8 @@ class TraceCtx:
     hermes_hot_ratio: float = None  # Hermes baseline: fraction of FFN neurons kept hot on GPU (None = disabled)
     hermes_cold_activation: float = 0.1  # Hermes: fraction of cold FFN neurons activated per token (streamed near-data on the DIMM)
     flexgen_host_offload: bool = False  # FlexGen baseline: KV cache on host DRAM, computed on GPU, streamed over the interconnect every decode step (transfer-bound, no near-memory compute)
+    infinigen_prefetch_ratio: float = None  # InfiniGen baseline: fraction of KV tokens speculatively prefetched to GPU per decode step (None = disabled). GPU compute, only the selected KV crosses the link.
+    infinigen_speculation_ratio: float = 0.25  # InfiniGen: partial-attention speculation scan cost as a fraction of the full-KV GPU attention (partial rank / head_dim)
 
 
 @dataclass
@@ -851,7 +853,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      link_bw=0, pnm_combine_comm=True,
                      pnm_kv_seq_partition=False, num_pnm_modules=1,
                      hermes_hot_ratio=None, hermes_cold_activation=0.1,
-                     flexgen_host_offload=False):
+                     flexgen_host_offload=False,
+                     infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -894,6 +897,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
         hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
         flexgen_host_offload=flexgen_host_offload,
+        infinigen_prefetch_ratio=infinigen_prefetch_ratio,
+        infinigen_speculation_ratio=infinigen_speculation_ratio,
     )
 
 
@@ -1223,6 +1228,77 @@ def _emit_flexgen_kv_load(ctx, bctx, lines, power_acc, layer_num, attn_gpu_ns, b
         power_acc.link_data_bytes += kv_bytes
 
 
+def _emit_infinigen_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
+    """Emit InfiniGen speculative-prefetch attention (NELSSA baseline).
+
+    InfiniGen keeps the KV cache in host DRAM but, unlike FlexGen, does not
+    stream the whole cache each step. It runs a cheap *speculation* pass -- a
+    partial query-key scan at reduced rank (a small on-GPU key sketch) -- to
+    predict which KV entries will dominate the attention score, then prefetches
+    only that critical fraction from host and computes attention on the GPU over
+    just those tokens. So per decode step it pays: (1) a speculation scan, (2) a
+    prefetch transfer of the *selected* KV over the interconnect, and (3) GPU
+    attention over the selected tokens. This is the middle ground between
+    FlexGen (transfer everything) and NELSSA's PNM (transfer nothing -- compute
+    in place): InfiniGen still ships the selected KV over the slow link.
+
+    Prefill is unaffected (KV is being built, not fetched); selection scales
+    only the decode KV. The prefetch double-buffers against compute, so only the
+    un-hidden residual extends the step.
+    """
+    if bctx.prefill_chunk == 0 and bctx.n_decode == 0:
+        return
+    ratio = ctx.infinigen_prefetch_ratio
+
+    # Full-KV GPU attention latency (what the speculation pass and the FlexGen
+    # arm would see) -- used to size the speculation scan.
+    full_attn_ns = _lookup_attention_with_skew(
+        ctx.perf_db, ctx.tp_size,
+        bctx.prefill_chunk, bctx.kv_prefill, bctx.n_decode,
+        bctx.kv_decode_mean, bctx.kv_decode_max, bctx.kv_decode_min)
+
+    # GPU attention over the SELECTED (prefetched) decode KV. Only decode is
+    # thinned; prefill (prefill_chunk / kv_prefill) stays full.
+    sel_kv = max(1, int(bctx.kv_decode_mean * ratio)) if bctx.n_decode > 0 else 0
+    sel_bctx = replace(bctx, kv_decode_mean=sel_kv, kv_decode_max=sel_kv, kv_decode_min=sel_kv)
+    attn_sel_ns = _emit_layer(ctx, sel_bctx, "attention", lines, power_acc, batch_tag, layer_num)
+
+    if bctx.n_decode <= 0:
+        return  # prefill-only step: no speculation / prefetch
+
+    # (1) Speculation scan: partial-rank query-key over the full KV to rank
+    # tokens. Cost is a fraction (partial rank / head_dim) of the full-KV GPU
+    # attention. Serial GPU compute.
+    spec_ns = max(0, int(ctx.infinigen_speculation_ratio * full_attn_ns))
+    if spec_ns > 0:
+        lines.append(formatter("kv_speculate", str(spec_ns),
+            'LOCAL', str(bctx.n_decode * ctx.n_head * ctx.head_dim * ctx.fp),
+            get_device(ctx.placement, layer_num, "attention", "weights"), '0',
+            'LOCAL', '0', 'NONE', '0', batch_tag))
+        if power_acc is not None:
+            power_acc.npu_latencies_ns.append(spec_ns)
+
+    # (2) Prefetch transfer of the selected KV over the interconnect, overlapped
+    # against the selected-KV attention + speculation -> residual.
+    if ctx.link_bw > 0:
+        streamed_tokens = int((bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean) * ratio)
+        if streamed_tokens > 0:
+            kv_heads_local = max(1, ctx.kv_head // max(1, ctx.tp_size))
+            per_tok_kv = 2 * kv_heads_local * ctx.head_dim * ctx.fp  # K + V per token
+            kv_bytes = streamed_tokens * per_tok_kv
+            kv_load_ns = int(kv_bytes / ctx.link_bw)  # link_bw GB/s == bytes/ns
+            residual = max(0, kv_load_ns - int(attn_sel_ns) - spec_ns)
+            if residual > 0:
+                lines.append(formatter("kv_prefetch", str(residual),
+                    'LOCAL', str(kv_bytes),
+                    get_device(ctx.placement, layer_num, "attention", "weights"), '0',
+                    'LOCAL', '0', 'NONE', '0', batch_tag))
+                if power_acc is not None:
+                    power_acc.npu_latencies_ns.append(residual)
+            if power_acc is not None:
+                power_acc.link_data_bytes += kv_bytes
+
+
 def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag='NONE'):
     """Emit MoE block: dispatch ALLTOALL + per-EP-rank expert compute + combine ALLTOALL.
 
@@ -1363,6 +1439,11 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
     """
     for layer_name in layers:
         if layer_name == "attention":
+            # InfiniGen speculative prefetch: GPU attention over a selected KV
+            # fraction + speculation scan + prefetch of only the selected KV.
+            if ctx.infinigen_prefetch_ratio is not None:
+                _emit_infinigen_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
+                continue
             if ctx.enable_attn_offloading:
                 _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
                 # NELSSA: build the RetrievalAttention index for prefilled KV.
@@ -1568,7 +1649,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       link_bw=0, pnm_combine_comm=True,
                       pnm_kv_seq_partition=False, num_pnm_modules=1,
                       hermes_hot_ratio=None, hermes_cold_activation=0.1,
-                      flexgen_host_offload=False):
+                      flexgen_host_offload=False,
+                      infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1583,7 +1665,9 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
                            pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
                            hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
-                           flexgen_host_offload=flexgen_host_offload)
+                           flexgen_host_offload=flexgen_host_offload,
+                           infinigen_prefetch_ratio=infinigen_prefetch_ratio,
+                           infinigen_speculation_ratio=infinigen_speculation_ratio)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1637,7 +1721,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                       link_bw=0, pnm_combine_comm=True,
                       pnm_kv_seq_partition=False, num_pnm_modules=1,
                       hermes_hot_ratio=None, hermes_cold_activation=0.1,
-                      flexgen_host_offload=False):
+                      flexgen_host_offload=False,
+                      infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -1652,7 +1737,9 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
                            pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
                            hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
-                           flexgen_host_offload=flexgen_host_offload)
+                           flexgen_host_offload=flexgen_host_offload,
+                           infinigen_prefetch_ratio=infinigen_prefetch_ratio,
+                           infinigen_speculation_ratio=infinigen_speculation_ratio)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1754,7 +1841,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    link_bw=0, pnm_combine_comm=True,
                    pnm_kv_seq_partition=False, num_pnm_modules=1,
                    hermes_hot_ratio=None, hermes_cold_activation=0.1,
-                   flexgen_host_offload=False):
+                   flexgen_host_offload=False,
+                   infinigen_prefetch_ratio=None, infinigen_speculation_ratio=0.25):
 
     model = batch.model
     config = get_config(model)
@@ -1814,7 +1902,9 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         link_bw=link_bw, pnm_combine_comm=pnm_combine_comm,
                         pnm_kv_seq_partition=pnm_kv_seq_partition, num_pnm_modules=num_pnm_modules,
                         hermes_hot_ratio=hermes_hot_ratio, hermes_cold_activation=hermes_cold_activation,
-                        flexgen_host_offload=flexgen_host_offload)
+                        flexgen_host_offload=flexgen_host_offload,
+                        infinigen_prefetch_ratio=infinigen_prefetch_ratio,
+                        infinigen_speculation_ratio=infinigen_speculation_ratio)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:

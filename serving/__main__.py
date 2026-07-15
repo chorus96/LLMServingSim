@@ -210,6 +210,25 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
                 f"offloading; they are competing KV strategies (FlexGen streams the full KV to "
                 f"the GPU, the PNM computes near-memory) -- pick one")
 
+        infinigen_prefetch_ratio = instance.get(
+            "infinigen_prefetch_ratio", args.infinigen_prefetch_ratio)
+        infinigen_speculation_ratio = instance.get(
+            "infinigen_speculation_ratio", args.infinigen_speculation_ratio)
+        if infinigen_prefetch_ratio is not None:
+            if enable_attn_offloading or flexgen_host_offload:
+                raise RuntimeError(
+                    f"Instance {instance_id} enables InfiniGen prefetch alongside another KV "
+                    f"strategy (attention offloading / FlexGen); they are competing host-offload "
+                    f"strategies -- pick one")
+            if not (0.0 < infinigen_prefetch_ratio <= 1.0):
+                raise ValueError(
+                    f"Instance {instance_id} infinigen_prefetch_ratio must be in (0, 1], "
+                    f"got {infinigen_prefetch_ratio}")
+            if infinigen_speculation_ratio < 0.0:
+                raise ValueError(
+                    f"Instance {instance_id} infinigen_speculation_ratio must be non-negative, "
+                    f"got {infinigen_speculation_ratio}")
+
         runtime_configs.append({
             "max_num_seqs": _runtime_limit(instance.get("max_num_seqs", args.max_num_seqs)),
             "max_num_batched_tokens": _runtime_limit(
@@ -245,6 +264,8 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "hermes_hot_ratio": hermes_hot_ratio,
             "hermes_cold_activation": instance.get("hermes_cold_activation", args.hermes_cold_activation),
             "flexgen_host_offload": flexgen_host_offload,
+            "infinigen_prefetch_ratio": infinigen_prefetch_ratio,
+            "infinigen_speculation_ratio": infinigen_speculation_ratio,
         })
     return runtime_configs
 
@@ -370,6 +391,18 @@ def main():
                         '(link_bw) every step. Transfer-bound (no near-memory compute, no '
                         'sparsity) -- the host-offload contrast to the PNM path. Mutually '
                         'exclusive with --enable-attn-offloading. Default: disabled')
+    parser.add_argument('--infinigen-prefetch-ratio', type=float, default=None,
+                        help='InfiniGen baseline: KV cache in host DRAM, but each decode step '
+                        'speculatively prefetches only this fraction of KV tokens to the GPU '
+                        '(e.g. 0.02) and computes attention over them. Pays a speculation scan + '
+                        'a transfer of the selected KV over the interconnect -- the middle ground '
+                        'between FlexGen (transfer all) and the PNM (transfer none). Enables '
+                        'InfiniGen. Mutually exclusive with --enable-attn-offloading / '
+                        '--flexgen-host-offload. Default: disabled')
+    parser.add_argument('--infinigen-speculation-ratio', type=float, default=0.25,
+                        help='InfiniGen: cost of the partial-attention speculation scan as a '
+                        'fraction of the full-KV GPU attention (partial rank / head_dim). Only '
+                        'applies with --infinigen-prefetch-ratio. Default: 0.25')
     parser.add_argument('--prioritize-prefill', action='store_true', default=False,
                         help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
@@ -580,6 +613,7 @@ def main():
             pim_on_cxl=pim_on_cxl,
             sparse_index_ratio=inst_cfg["sparse_index_footprint_ratio"],
             flexgen_host_offload=inst_cfg["flexgen_host_offload"],
+            infinigen_prefetch=inst_cfg["infinigen_prefetch_ratio"] is not None,
         ))
 
     # Controller for astra-sim process communication
@@ -788,6 +822,8 @@ def main():
                                        hermes_hot_ratio=inst_cfg["hermes_hot_ratio"],
                                        hermes_cold_activation=inst_cfg["hermes_cold_activation"],
                                        flexgen_host_offload=inst_cfg["flexgen_host_offload"],
+                                       infinigen_prefetch_ratio=inst_cfg["infinigen_prefetch_ratio"],
+                                       infinigen_speculation_ratio=inst_cfg["infinigen_speculation_ratio"],
                                        inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
@@ -867,6 +903,8 @@ def main():
                                            hermes_hot_ratio=inst_cfg["hermes_hot_ratio"],
                                            hermes_cold_activation=inst_cfg["hermes_cold_activation"],
                                            flexgen_host_offload=inst_cfg["flexgen_host_offload"],
+                                           infinigen_prefetch_ratio=inst_cfg["infinigen_prefetch_ratio"],
+                                           infinigen_speculation_ratio=inst_cfg["infinigen_speculation_ratio"],
                                            inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
@@ -915,6 +953,8 @@ def main():
                                    hermes_hot_ratio=inst_cfg["hermes_hot_ratio"],
                                    hermes_cold_activation=inst_cfg["hermes_cold_activation"],
                                    flexgen_host_offload=inst_cfg["flexgen_host_offload"],
+                                   infinigen_prefetch_ratio=inst_cfg["infinigen_prefetch_ratio"],
+                                   infinigen_speculation_ratio=inst_cfg["infinigen_speculation_ratio"],
                                    inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

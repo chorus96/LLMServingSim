@@ -22,7 +22,7 @@ class Scheduler:
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
                  enable_attn_offloading=False, pim_on_cxl=False, sparse_index_ratio=0.0,
-                 flexgen_host_offload=False):
+                 flexgen_host_offload=False, infinigen_prefetch=False):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -48,7 +48,7 @@ class Scheduler:
         self.batch_ids = -1
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype, enable_attn_offloading=enable_attn_offloading, pim_on_cxl=pim_on_cxl, sparse_index_ratio=sparse_index_ratio, flexgen_host_offload=flexgen_host_offload)
+        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype, enable_attn_offloading=enable_attn_offloading, pim_on_cxl=pim_on_cxl, sparse_index_ratio=sparse_index_ratio, flexgen_host_offload=flexgen_host_offload, infinigen_prefetch=infinigen_prefetch)
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
